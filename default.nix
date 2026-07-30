@@ -115,7 +115,9 @@ flake-utils.lib.eachSystem systems (
             npm_config_build_from_source=true \
               npm_config_nodedir="${pkgs.nodejs.dev}" \
               npm run install --offline
-            chmod +x build/Release/spawn-helper
+            ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+              chmod +x build/Release/spawn-helper
+            ''}
             find build -type f -exec ${pkgs.lib.getExe pkgs.removeReferencesTo} -t "${pkgs.nodejs.dev}" {} \;
             popd
 
