@@ -1,0 +1,1168 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import {
+  type CodexRequest,
+  type CodexThread,
+  type CodexThreadItem,
+  type CodexTurn,
+  type JsonRpcId,
+  notify,
+  parsePrimeThreadId,
+  primeThreadId,
+  rpcError,
+  rpcResult,
+  threadFromPrimeSession,
+  turnsFromPrimeMessages,
+  writeJsonLine,
+} from "./codex-protocol";
+import { PrimeSessionCatalog, type PrimeSavedSession } from "../prime/catalog";
+import { StrictJsonlDecoder, serializeJsonLine } from "../prime/jsonl";
+import {
+  PrimeAgentRpcClient,
+  type PrimeRpcEvent,
+  type PrimeThinkingLevel,
+} from "../prime/rpc-client";
+import {
+  readPrimeCodexControlState,
+  writePrimeCodexControlState,
+} from "../primecodex-control";
+
+export type PrimeCodexMode = "prime" | "hybrid";
+
+const PRIME_MODEL_PREFIX = "prime/";
+
+type PrimeState = {
+  model?: {
+    id?: string;
+    provider?: string;
+    contextWindow?: number;
+  };
+  thinkingLevel?: string;
+  sessionFile?: string;
+  sessionId?: string;
+};
+
+type PrimeCompatSession = {
+  threadId: string;
+  sessionId: string;
+  cwd: string;
+  client: PrimeAgentRpcClient;
+  state: PrimeState;
+  currentTurn?: PrimeTurnContext;
+};
+
+type PrimeToolRuntime = {
+  item: CodexThreadItem;
+  output: string;
+  startedAtMs: number;
+};
+
+type PrimeTurnContext = {
+  id: string;
+  userItem: CodexThreadItem;
+  items: CodexThreadItem[];
+  startedAtMs: number;
+  ready: boolean;
+  bufferedEvents: PrimeRpcEvent[];
+  agentItem?: CodexThreadItem;
+  reasoningItem?: CodexThreadItem;
+  tools: Map<string, PrimeToolRuntime>;
+  interrupted: boolean;
+  failed: boolean;
+  latestUsage?: Record<string, unknown>;
+};
+
+type ResponseHandler = (message: Record<string, unknown>) => void;
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function contentText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((entry) => {
+      const block = asRecord(entry);
+      return block.type === "text" && typeof block.text === "string";
+    })
+    .map((entry) => String(asRecord(entry).text))
+    .join("");
+}
+
+function outputText(value: unknown): string {
+  const record = asRecord(value);
+  const content = record.content;
+  return contentText(content);
+}
+
+function toolCommand(toolName: string, args: unknown): string {
+  const record = asRecord(args);
+  const preferred = [record.code, record.command, record.cmd].find(
+    (value) => typeof value === "string" && value.length > 0,
+  );
+  if (typeof preferred === "string") return preferred;
+  if (Object.keys(record).length === 0) return toolName;
+  return `${toolName} ${JSON.stringify(record)}`;
+}
+
+function toPrimeThinking(value: unknown): PrimeThinkingLevel | undefined {
+  if (value === "ultra") return "xhigh";
+  if (
+    value === "off" ||
+    value === "minimal" ||
+    value === "low" ||
+    value === "medium" ||
+    value === "high" ||
+    value === "xhigh" ||
+    value === "max"
+  ) {
+    return value;
+  }
+  return undefined;
+}
+
+function modelFromState(state: PrimeState): string {
+  return state.model?.id ?? "gpt-5.6-sol";
+}
+
+function reasoningFromState(state: PrimeState): string {
+  return state.thinkingLevel ?? "xhigh";
+}
+
+function primeProvider(value: unknown): string {
+  const provider = optionalString(value);
+  if (!provider || provider === "openai") return "openai-codex";
+  return provider;
+}
+
+function primeModelId(value: unknown): string | undefined {
+  const model = optionalString(value);
+  if (!model) return undefined;
+  return model.startsWith(PRIME_MODEL_PREFIX)
+    ? model.slice(PRIME_MODEL_PREFIX.length)
+    : model;
+}
+
+function isPrimeModelId(value: unknown): boolean {
+  return optionalString(value)?.startsWith(PRIME_MODEL_PREFIX) === true;
+}
+
+function sessionFromState(
+  state: PrimeState,
+  cwd: string,
+  now = Date.now(),
+): PrimeSavedSession {
+  if (!state.sessionId || !state.sessionFile) {
+    throw new Error("Prime Agent did not return a persistent session id/file");
+  }
+  return {
+    sessionId: state.sessionId,
+    filePath: state.sessionFile,
+    cwd,
+    createdAtMs: now,
+    updatedAtMs: now,
+    preview: "",
+    model: state.model?.id,
+    provider: state.model?.provider,
+    thinking: state.thinkingLevel,
+    archived: false,
+    messages: [],
+  };
+}
+
+function sessionStartResult(
+  thread: CodexThread,
+  state: PrimeState,
+  uiModel = modelFromState(state),
+): Record<string, unknown> {
+  return {
+    thread,
+    model: uiModel,
+    modelProvider: "openai",
+    serviceTier: "default",
+    cwd: thread.cwd,
+    runtimeWorkspaceRoots: [thread.cwd],
+    instructionSources: [],
+    approvalPolicy: "never",
+    approvalsReviewer: "user",
+    sandbox: { type: "dangerFullAccess" },
+    activePermissionProfile: null,
+    reasoningEffort: reasoningFromState(state),
+    multiAgentMode: "explicitRequestOnly",
+  };
+}
+
+class RealCodexProxy {
+  private readonly child: ChildProcessWithoutNullStreams;
+  private readonly responseHandlers = new Map<string, ResponseHandler>();
+  private stopping = false;
+
+  constructor(command: string, args: string[]) {
+    this.child = spawn(command, args, {
+      env: process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    this.child.stderr.pipe(process.stderr);
+
+    const decoder = new StrictJsonlDecoder();
+    this.child.stdout.on("data", (chunk: Buffer) => {
+      for (const line of decoder.push(chunk)) this.handleLine(line);
+    });
+    this.child.stdout.on("end", () => {
+      for (const line of decoder.end()) this.handleLine(line);
+    });
+    this.child.on("exit", (code, signal) => {
+      if (this.stopping) return;
+      if (signal) process.kill(process.pid, signal);
+      else process.exitCode = code ?? 1;
+    });
+  }
+
+  send(value: unknown, responseHandler?: ResponseHandler): void {
+    const record = asRecord(value);
+    if (responseHandler && record.id !== undefined) {
+      this.responseHandlers.set(String(record.id), responseHandler);
+    }
+    this.child.stdin.write(serializeJsonLine(value));
+  }
+
+  stop(): void {
+    this.stopping = true;
+    this.child.kill("SIGTERM");
+  }
+
+  private handleLine(line: string): void {
+    if (!line.trim()) return;
+    let message: Record<string, unknown>;
+    try {
+      message = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      process.stdout.write(`${line}\n`);
+      return;
+    }
+
+    if (message.id !== undefined) {
+      const key = String(message.id);
+      const handler = this.responseHandlers.get(key);
+      if (handler) {
+        this.responseHandlers.delete(key);
+        handler(message);
+        return;
+      }
+    }
+    writeJsonLine(message);
+  }
+}
+
+export type CodexPrimeBridgeOptions = {
+  realCodexCommand: string;
+  realCodexArgs: string[];
+  primeCommand: string;
+  mode: PrimeCodexMode;
+  newThreadBackend: "codex" | "prime";
+  controlFile?: string;
+  defaultPrimeThinking: PrimeThinkingLevel;
+};
+
+export class CodexPrimeBridge {
+  private readonly codex: RealCodexProxy;
+  private readonly catalog = new PrimeSessionCatalog();
+  private readonly livePrimeThreads = new Map<string, PrimeCompatSession>();
+  private pendingPrimeCwd: string | undefined;
+
+  constructor(private readonly options: CodexPrimeBridgeOptions) {
+    this.codex = new RealCodexProxy(
+      options.realCodexCommand,
+      options.realCodexArgs,
+    );
+  }
+
+  async handle(value: unknown): Promise<void> {
+    const request = asRecord(value) as CodexRequest;
+    if (!request.method) {
+      this.codex.send(value);
+      return;
+    }
+
+    try {
+      if (request.method === "thread/list" && request.id !== undefined) {
+        await this.handleThreadList(request);
+        return;
+      }
+
+      if (
+        request.method === "model/list" &&
+        request.id !== undefined &&
+        this.options.mode === "hybrid"
+      ) {
+        this.handleHybridModelList(request);
+        return;
+      }
+
+      if (
+        request.method === "thread/start" &&
+        request.id !== undefined &&
+        (await this.shouldCreatePrimeThread(request.params ?? {}))
+      ) {
+        await this.handlePrimeThreadStart(request.id, request.params ?? {});
+        return;
+      }
+
+      const threadId = optionalString(request.params?.threadId);
+      if (threadId && (await this.isPrimeThread(threadId))) {
+        if (request.id === undefined) {
+          return;
+        }
+        await this.handlePrimeRequest(
+          request.id,
+          request.method,
+          threadId,
+          request.params ?? {},
+        );
+        return;
+      }
+
+      this.codex.send(value);
+    } catch (error) {
+      if (request.id !== undefined) {
+        rpcError(
+          request.id,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+  }
+
+  async close(): Promise<void> {
+    this.codex.stop();
+    await Promise.allSettled(
+      Array.from(this.livePrimeThreads.values(), ({ client }) => client.stop()),
+    );
+    this.livePrimeThreads.clear();
+  }
+
+  private async shouldCreatePrimeThread(
+    params: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (isPrimeModelId(params.model) || this.options.mode === "prime") {
+      return true;
+    }
+    if (this.options.mode !== "hybrid") return false;
+
+    const controlFile = this.options.controlFile;
+    if (!controlFile) return this.options.newThreadBackend === "prime";
+    const control = await readPrimeCodexControlState(controlFile, {
+      activeBackend: this.options.newThreadBackend,
+      newThreadBackend: this.options.newThreadBackend,
+    });
+    if (control.newThreadBackend !== "prime") return false;
+
+    this.pendingPrimeCwd = control.projectCwd;
+
+    // The Codex renderer can create invisible helper threads (for example for
+    // title generation) immediately after the user-visible thread. Treat the
+    // Prime selection as "the next task" so those helpers stay on native Codex
+    // instead of leaking into Prime's saved-session list.
+    await writePrimeCodexControlState(controlFile, {
+      ...control,
+      newThreadBackend: "codex",
+    });
+    return true;
+  }
+
+  private async isPrimeThread(threadId: string): Promise<boolean> {
+    if (this.livePrimeThreads.has(threadId)) return true;
+    const sessionId = parsePrimeThreadId(threadId);
+    if (!sessionId) return false;
+    return (await this.catalog.find(sessionId)) !== undefined;
+  }
+
+  private handleHybridModelList(request: CodexRequest): void {
+    this.codex.send(request, (message) => {
+      if (message.error) {
+        writeJsonLine(message);
+        return;
+      }
+      const result = asRecord(message.result);
+      const nativeModels = Array.isArray(result.data) ? result.data : [];
+      const primeModels = nativeModels.map((value) => {
+        const model = asRecord(value);
+        const id = optionalString(model.id);
+        if (!id) return model;
+        const efforts = Array.isArray(model.supportedReasoningEfforts)
+          ? model.supportedReasoningEfforts.filter(
+              (entry) => asRecord(entry).reasoningEffort !== "ultra",
+            )
+          : [];
+        return {
+          ...model,
+          id: `${PRIME_MODEL_PREFIX}${id}`,
+          model: `${PRIME_MODEL_PREFIX}${id}`,
+          displayName: `Prime · ${optionalString(model.displayName) ?? id}`,
+          description:
+            `Prime Agent RLM harness · ${optionalString(model.description) ?? ""}`.trim(),
+          supportedReasoningEfforts: efforts,
+          additionalSpeedTiers: [],
+          serviceTiers: [],
+          defaultServiceTier: null,
+          isDefault: false,
+        };
+      });
+      writeJsonLine({
+        ...message,
+        result: {
+          ...result,
+          data: [...nativeModels, ...primeModels],
+        },
+      });
+    });
+  }
+
+  private async handleThreadList(request: CodexRequest): Promise<void> {
+    const id = request.id as JsonRpcId;
+    const params = request.params ?? {};
+    const primeThreads = await this.listPrimeThreads(params);
+
+    if (this.options.mode === "prime") {
+      rpcResult(id, {
+        data: primeThreads,
+        nextCursor: null,
+        backwardsCursor: null,
+      });
+      return;
+    }
+
+    this.codex.send(request, (message) => {
+      if (message.error) {
+        writeJsonLine(message);
+        return;
+      }
+      const result = asRecord(message.result);
+      const data = Array.isArray(result.data) ? result.data : [];
+      const merged = [...data, ...primeThreads].sort((left, right) => {
+        const l = numberOrNull(asRecord(left).updatedAt) ?? 0;
+        const r = numberOrNull(asRecord(right).updatedAt) ?? 0;
+        return r - l;
+      });
+      writeJsonLine({
+        ...message,
+        result: { ...result, data: merged },
+      });
+    });
+  }
+
+  private async listPrimeThreads(
+    params: Record<string, unknown>,
+  ): Promise<CodexThread[]> {
+    if (params.cursor) return [];
+    const archived = params.archived === true;
+    const cwdFilter = Array.isArray(params.cwd)
+      ? params.cwd.filter((value): value is string => typeof value === "string")
+      : typeof params.cwd === "string"
+        ? [params.cwd]
+        : [];
+    const searchTerm = optionalString(params.searchTerm)?.toLowerCase();
+    let sessions = (await this.catalog.list()).filter(
+      (session) => session.archived === archived,
+    );
+    if (cwdFilter.length > 0) {
+      sessions = sessions.filter((session) => cwdFilter.includes(session.cwd));
+    }
+    if (searchTerm) {
+      sessions = sessions.filter((session) =>
+        `${session.name ?? ""}\n${session.preview}`
+          .toLowerCase()
+          .includes(searchTerm),
+      );
+    }
+
+    const direction = params.sortDirection === "asc" ? 1 : -1;
+    sessions.sort(
+      (left, right) => direction * (right.updatedAtMs - left.updatedAtMs),
+    );
+    const limit =
+      typeof params.limit === "number" && params.limit > 0
+        ? Math.floor(params.limit)
+        : sessions.length;
+    return sessions.slice(0, limit).map((session) =>
+      threadFromPrimeSession(session, {
+        loaded: this.livePrimeThreads.has(primeThreadId(session.sessionId)),
+      }),
+    );
+  }
+
+  private async handlePrimeThreadStart(
+    id: JsonRpcId,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const cwd =
+      this.pendingPrimeCwd ?? optionalString(params.cwd) ?? process.cwd();
+    this.pendingPrimeCwd = undefined;
+    const client = new PrimeAgentRpcClient({
+      command: this.options.primeCommand,
+      cwd,
+      ...(primeModelId(params.model)
+        ? {
+            model: primeModelId(params.model),
+            provider: primeProvider(params.modelProvider),
+          }
+        : {}),
+      thinking: this.options.defaultPrimeThinking,
+    });
+    await client.start();
+    try {
+      const state = asRecord(
+        (await client.request({ type: "get_state" })).data,
+      ) as PrimeState;
+      const saved = sessionFromState(state, cwd);
+      const thread = threadFromPrimeSession(saved, { loaded: true });
+      const session: PrimeCompatSession = {
+        threadId: thread.id,
+        sessionId: saved.sessionId,
+        cwd,
+        client,
+        state,
+      };
+      this.bindPrimeSession(session);
+      this.livePrimeThreads.set(thread.id, session);
+      rpcResult(id, sessionStartResult(thread, state, this.uiModel(state)));
+      notify("thread/started", { thread });
+    } catch (error) {
+      await client.stop();
+      throw error;
+    }
+  }
+
+  private async handlePrimeRequest(
+    id: JsonRpcId,
+    method: string,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    switch (method) {
+      case "thread/read":
+        await this.handlePrimeThreadRead(id, threadId, params);
+        return;
+      case "thread/resume":
+        await this.handlePrimeThreadResume(id, threadId, params);
+        return;
+      case "thread/turns/list":
+        await this.handlePrimeTurnsList(id, threadId, params);
+        return;
+      case "thread/items/list":
+        await this.handlePrimeItemsList(id, threadId, params);
+        return;
+      case "thread/name/set":
+        await this.handlePrimeThreadName(id, threadId, params);
+        return;
+      case "turn/start":
+        await this.handlePrimeTurnStart(id, threadId, params);
+        return;
+      case "turn/interrupt":
+        await this.handlePrimeTurnInterrupt(id, threadId);
+        return;
+      default:
+        rpcError(
+          id,
+          `PrimeCodex does not yet support ${method} for Prime threads`,
+          -32601,
+        );
+    }
+  }
+
+  private async handlePrimeThreadRead(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const saved = await this.requireSavedPrimeThread(threadId);
+    rpcResult(id, {
+      thread: threadFromPrimeSession(saved, {
+        loaded: this.livePrimeThreads.has(threadId),
+        includeTurns: params.includeTurns === true,
+      }),
+    });
+  }
+
+  private async handlePrimeThreadResume(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const session = await this.ensurePrimeSession(threadId, params);
+    const saved = await this.requireSavedPrimeThread(threadId);
+    const thread = threadFromPrimeSession(saved, {
+      loaded: true,
+      includeTurns: params.excludeTurns !== true,
+    });
+    const result = sessionStartResult(
+      thread,
+      session.state,
+      this.uiModel(session.state),
+    );
+    const initialTurnsPage = asRecord(params.initialTurnsPage);
+    const turns = thread.turns;
+    const pageLimit =
+      typeof initialTurnsPage.limit === "number" && initialTurnsPage.limit > 0
+        ? Math.floor(initialTurnsPage.limit)
+        : turns.length;
+    rpcResult(id, {
+      ...result,
+      initialTurnsPage:
+        params.initialTurnsPage && params.excludeTurns !== true
+          ? {
+              data: turns.slice(-pageLimit),
+              nextCursor: null,
+              backwardsCursor: null,
+            }
+          : null,
+      turnsBackwardsCursor: null,
+      itemsBackwardsCursor: null,
+    });
+  }
+
+  private async handlePrimeTurnsList(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const saved = await this.requireSavedPrimeThread(threadId);
+    let turns = turnsFromPrimeMessages(saved.messages);
+    if (params.sortDirection !== "asc") turns = [...turns].reverse();
+    const limit =
+      typeof params.limit === "number" && params.limit > 0
+        ? Math.floor(params.limit)
+        : turns.length;
+    rpcResult(id, {
+      data: turns.slice(0, limit),
+      nextCursor: null,
+      backwardsCursor: null,
+    });
+  }
+
+  private async handlePrimeItemsList(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const saved = await this.requireSavedPrimeThread(threadId);
+    let entries = turnsFromPrimeMessages(saved.messages).flatMap((turn) =>
+      turn.items.map((item) => ({ turnId: turn.id, item })),
+    );
+    const turnId = optionalString(params.turnId);
+    if (turnId) entries = entries.filter((entry) => entry.turnId === turnId);
+    if (params.sortDirection === "desc") entries = [...entries].reverse();
+    const limit =
+      typeof params.limit === "number" && params.limit > 0
+        ? Math.floor(params.limit)
+        : entries.length;
+    rpcResult(id, {
+      data: entries.slice(0, limit),
+      nextCursor: null,
+      backwardsCursor: null,
+    });
+  }
+
+  private async handlePrimeThreadName(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const name = optionalString(params.name);
+    if (!name) throw new Error("thread/name/set requires a name");
+    const session = await this.ensurePrimeSession(threadId);
+    await session.client.request({ type: "set_session_name", name });
+    rpcResult(id, {});
+    notify("thread/name/updated", { threadId, threadName: name });
+  }
+
+  private async handlePrimeTurnStart(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const session = await this.ensurePrimeSession(threadId);
+    if (session.currentTurn) {
+      throw new Error("Prime Agent already has a turn in progress");
+    }
+
+    const input = Array.isArray(params.input) ? params.input : [];
+    const texts = input
+      .map((entry) => asRecord(entry))
+      .filter(
+        (entry) => entry.type === "text" && typeof entry.text === "string",
+      )
+      .map((entry) => String(entry.text));
+    const message = texts.join("\n").trim();
+    if (!message) throw new Error("PrimeCodex currently requires text input");
+
+    const requestedModel = primeModelId(params.model);
+    if (requestedModel && requestedModel !== modelFromState(session.state)) {
+      await session.client.request({
+        type: "set_model",
+        provider: primeProvider(session.state.model?.provider),
+        modelId: requestedModel,
+      });
+    }
+    const thinking = toPrimeThinking(params.effort);
+    if (thinking) {
+      await session.client.request({
+        type: "set_thinking_level",
+        level: thinking,
+      });
+      session.state.thinkingLevel = thinking;
+    }
+
+    const turn: PrimeTurnContext = {
+      id: randomUUID(),
+      userItem: {
+        type: "userMessage",
+        id: randomUUID(),
+        clientId: optionalString(params.clientUserMessageId) ?? null,
+        content: input,
+      },
+      items: [],
+      startedAtMs: Date.now(),
+      ready: false,
+      bufferedEvents: [],
+      tools: new Map(),
+      interrupted: false,
+      failed: false,
+    };
+    session.currentTurn = turn;
+
+    try {
+      await session.client.request({ type: "prompt", message });
+      const codexTurn = this.codexTurn(turn, "inProgress");
+      rpcResult(id, { turn: codexTurn });
+      this.emitThreadSettings(session);
+      notify("thread/status/changed", {
+        threadId,
+        status: { type: "active", activeFlags: [] },
+      });
+      notify("turn/started", { threadId, turn: codexTurn });
+      notify("item/started", {
+        item: turn.userItem,
+        threadId,
+        turnId: turn.id,
+        startedAtMs: turn.startedAtMs,
+      });
+      notify("item/completed", {
+        item: turn.userItem,
+        threadId,
+        turnId: turn.id,
+        completedAtMs: Date.now(),
+      });
+      turn.ready = true;
+      for (const event of turn.bufferedEvents.splice(0)) {
+        this.translatePrimeEvent(session, event);
+      }
+    } catch (error) {
+      session.currentTurn = undefined;
+      throw error;
+    }
+  }
+
+  private async handlePrimeTurnInterrupt(
+    id: JsonRpcId,
+    threadId: string,
+  ): Promise<void> {
+    const session = this.livePrimeThreads.get(threadId);
+    if (!session?.currentTurn) {
+      rpcResult(id, {});
+      return;
+    }
+    session.currentTurn.interrupted = true;
+    await session.client.request({ type: "abort" });
+    rpcResult(id, {});
+  }
+
+  private async ensurePrimeSession(
+    threadId: string,
+    overrides: Record<string, unknown> = {},
+  ): Promise<PrimeCompatSession> {
+    const existing = this.livePrimeThreads.get(threadId);
+    if (existing) return existing;
+
+    const sessionId = parsePrimeThreadId(threadId);
+    if (!sessionId) throw new Error(`Not a Prime thread: ${threadId}`);
+    const saved = await this.catalog.find(sessionId);
+    if (!saved) throw new Error(`Prime Agent session not found: ${sessionId}`);
+
+    const client = new PrimeAgentRpcClient({
+      command: this.options.primeCommand,
+      cwd: optionalString(overrides.cwd) ?? saved.cwd,
+      resume: sessionId,
+      ...(primeModelId(overrides.model)
+        ? {
+            model: primeModelId(overrides.model),
+            provider: primeProvider(overrides.modelProvider ?? saved.provider),
+          }
+        : saved.model
+          ? {
+              model: saved.model,
+              provider: primeProvider(saved.provider),
+            }
+          : {}),
+      thinking:
+        toPrimeThinking(saved.thinking) ?? this.options.defaultPrimeThinking,
+    });
+    await client.start();
+    try {
+      const state = asRecord(
+        (await client.request({ type: "get_state" })).data,
+      ) as PrimeState;
+      const session: PrimeCompatSession = {
+        threadId,
+        sessionId,
+        cwd: optionalString(overrides.cwd) ?? saved.cwd,
+        client,
+        state,
+      };
+      this.bindPrimeSession(session);
+      this.livePrimeThreads.set(threadId, session);
+      return session;
+    } catch (error) {
+      await client.stop();
+      throw error;
+    }
+  }
+
+  private bindPrimeSession(session: PrimeCompatSession): void {
+    session.client.onEvent((event) => {
+      const turn = session.currentTurn;
+      if (!turn) return;
+      if (!turn.ready) {
+        turn.bufferedEvents.push(event);
+        return;
+      }
+      this.translatePrimeEvent(session, event);
+    });
+  }
+
+  private translatePrimeEvent(
+    session: PrimeCompatSession,
+    event: PrimeRpcEvent,
+  ): void {
+    const turn = session.currentTurn;
+    if (!turn) return;
+    const threadId = session.threadId;
+
+    if (event.type === "message_update") {
+      const update = asRecord(event.assistantMessageEvent);
+      if (update.type === "text_start") {
+        this.ensureAgentItem(threadId, turn);
+      } else if (update.type === "text_delta") {
+        const item = this.ensureAgentItem(threadId, turn);
+        const delta = optionalString(update.delta) ?? "";
+        item.text = `${typeof item.text === "string" ? item.text : ""}${delta}`;
+        notify("item/agentMessage/delta", {
+          threadId,
+          turnId: turn.id,
+          itemId: item.id,
+          delta,
+        });
+      } else if (update.type === "thinking_start") {
+        this.ensureReasoningItem(threadId, turn);
+      } else if (update.type === "thinking_delta") {
+        const item = this.ensureReasoningItem(threadId, turn);
+        const delta = optionalString(update.delta) ?? "";
+        const summary = Array.isArray(item.summary) ? item.summary : [""];
+        summary[0] = `${typeof summary[0] === "string" ? summary[0] : ""}${delta}`;
+        item.summary = summary;
+        notify("item/reasoning/summaryTextDelta", {
+          threadId,
+          turnId: turn.id,
+          itemId: item.id,
+          delta,
+          summaryIndex: 0,
+        });
+      } else if (update.type === "error") {
+        turn.failed = update.reason !== "aborted";
+        turn.interrupted = update.reason === "aborted";
+      }
+      return;
+    }
+
+    if (event.type === "message_end") {
+      const message = asRecord(event.message);
+      if (message.role === "assistant") {
+        if (turn.agentItem) {
+          const fullText = contentText(message.content);
+          if (fullText) turn.agentItem.text = fullText;
+          this.completeItem(threadId, turn, turn.agentItem);
+          turn.agentItem = undefined;
+        }
+        if (turn.reasoningItem) {
+          this.completeItem(threadId, turn, turn.reasoningItem);
+          turn.reasoningItem = undefined;
+        }
+        if (message.usage && typeof message.usage === "object") {
+          turn.latestUsage = asRecord(message.usage);
+        }
+        if (message.stopReason === "aborted") turn.interrupted = true;
+        if (message.stopReason === "error") turn.failed = true;
+      }
+      return;
+    }
+
+    if (event.type === "tool_execution_start") {
+      const callId = optionalString(event.toolCallId) ?? randomUUID();
+      const toolName = optionalString(event.toolName) ?? "tool";
+      const item: CodexThreadItem = {
+        type: "commandExecution",
+        id: `prime-tool:${callId}`,
+        pluginId: null,
+        scriptPath: null,
+        command: toolCommand(toolName, event.args),
+        cwd: session.cwd,
+        processId: null,
+        source: "agent",
+        status: "inProgress",
+        commandActions: [],
+        aggregatedOutput: null,
+        exitCode: null,
+        durationMs: null,
+      };
+      const startedAtMs = Date.now();
+      turn.tools.set(callId, { item, output: "", startedAtMs });
+      notify("item/started", {
+        item,
+        threadId,
+        turnId: turn.id,
+        startedAtMs,
+      });
+      return;
+    }
+
+    if (event.type === "tool_execution_update") {
+      const callId = optionalString(event.toolCallId);
+      if (!callId) return;
+      const runtime = turn.tools.get(callId);
+      if (!runtime) return;
+      const nextOutput = outputText(event.partialResult);
+      const delta = nextOutput.startsWith(runtime.output)
+        ? nextOutput.slice(runtime.output.length)
+        : nextOutput;
+      runtime.output = nextOutput;
+      runtime.item.aggregatedOutput = nextOutput;
+      if (delta) {
+        notify("item/commandExecution/outputDelta", {
+          threadId,
+          turnId: turn.id,
+          itemId: runtime.item.id,
+          delta,
+        });
+      }
+      return;
+    }
+
+    if (event.type === "tool_execution_end") {
+      const callId = optionalString(event.toolCallId);
+      if (!callId) return;
+      const runtime = turn.tools.get(callId);
+      if (!runtime) return;
+      const finalOutput = outputText(event.result) || runtime.output;
+      const isError = event.isError === true;
+      runtime.item.aggregatedOutput = finalOutput;
+      runtime.item.status = isError ? "failed" : "completed";
+      runtime.item.exitCode = isError ? 1 : 0;
+      runtime.item.durationMs = Date.now() - runtime.startedAtMs;
+      this.completeItem(threadId, turn, runtime.item);
+      turn.tools.delete(callId);
+      return;
+    }
+
+    if (event.type === "agent_end") {
+      this.finishPrimeTurn(session);
+    }
+  }
+
+  private ensureAgentItem(
+    threadId: string,
+    turn: PrimeTurnContext,
+  ): CodexThreadItem {
+    if (turn.agentItem) return turn.agentItem;
+    const item: CodexThreadItem = {
+      type: "agentMessage",
+      id: randomUUID(),
+      text: "",
+      phase: "final_answer",
+      memoryCitation: null,
+    };
+    turn.agentItem = item;
+    notify("item/started", {
+      item,
+      threadId,
+      turnId: turn.id,
+      startedAtMs: Date.now(),
+    });
+    return item;
+  }
+
+  private ensureReasoningItem(
+    threadId: string,
+    turn: PrimeTurnContext,
+  ): CodexThreadItem {
+    if (turn.reasoningItem) return turn.reasoningItem;
+    const item: CodexThreadItem = {
+      type: "reasoning",
+      id: randomUUID(),
+      summary: [""],
+      content: [],
+    };
+    turn.reasoningItem = item;
+    notify("item/started", {
+      item,
+      threadId,
+      turnId: turn.id,
+      startedAtMs: Date.now(),
+    });
+    return item;
+  }
+
+  private completeItem(
+    threadId: string,
+    turn: PrimeTurnContext,
+    item: CodexThreadItem,
+  ): void {
+    turn.items.push({ ...item });
+    notify("item/completed", {
+      item,
+      threadId,
+      turnId: turn.id,
+      completedAtMs: Date.now(),
+    });
+  }
+
+  private finishPrimeTurn(session: PrimeCompatSession): void {
+    const turn = session.currentTurn;
+    if (!turn) return;
+    for (const runtime of turn.tools.values()) {
+      runtime.item.status = "failed";
+      runtime.item.durationMs = Date.now() - runtime.startedAtMs;
+      this.completeItem(session.threadId, turn, runtime.item);
+    }
+    turn.tools.clear();
+
+    if (turn.agentItem) {
+      this.completeItem(session.threadId, turn, turn.agentItem);
+      turn.agentItem = undefined;
+    }
+    if (turn.reasoningItem) {
+      this.completeItem(session.threadId, turn, turn.reasoningItem);
+      turn.reasoningItem = undefined;
+    }
+
+    if (turn.latestUsage) {
+      const usage = turn.latestUsage;
+      const breakdown = {
+        totalTokens: numberOrNull(usage.totalTokens) ?? 0,
+        inputTokens: numberOrNull(usage.input) ?? 0,
+        cachedInputTokens: numberOrNull(usage.cacheRead) ?? 0,
+        cacheWriteInputTokens: numberOrNull(usage.cacheWrite) ?? 0,
+        outputTokens: numberOrNull(usage.output) ?? 0,
+        reasoningOutputTokens: 0,
+      };
+      notify("thread/tokenUsage/updated", {
+        threadId: session.threadId,
+        turnId: turn.id,
+        tokenUsage: {
+          total: breakdown,
+          last: breakdown,
+          modelContextWindow: session.state.model?.contextWindow ?? null,
+        },
+      });
+    }
+
+    notify("thread/status/changed", {
+      threadId: session.threadId,
+      status: { type: "idle" },
+    });
+    const status = turn.interrupted
+      ? "interrupted"
+      : turn.failed
+        ? "failed"
+        : "completed";
+    notify("turn/completed", {
+      threadId: session.threadId,
+      turn: this.codexTurn(turn, status),
+    });
+    session.currentTurn = undefined;
+  }
+
+  private codexTurn(
+    turn: PrimeTurnContext,
+    status: CodexTurn["status"],
+  ): CodexTurn {
+    const completed = status === "inProgress" ? null : Date.now();
+    return {
+      id: turn.id,
+      items: status === "inProgress" ? [] : turn.items,
+      itemsView: status === "inProgress" ? "notLoaded" : "summary",
+      status,
+      error:
+        status === "failed" ? { message: "Prime Agent turn failed" } : null,
+      startedAt: Math.floor(turn.startedAtMs / 1_000),
+      completedAt: completed ? Math.floor(completed / 1_000) : null,
+      durationMs: completed ? completed - turn.startedAtMs : null,
+    };
+  }
+
+  private emitThreadSettings(session: PrimeCompatSession): void {
+    const model = this.uiModel(session.state);
+    const effort = reasoningFromState(session.state);
+    notify("thread/settings/updated", {
+      threadId: session.threadId,
+      threadSettings: {
+        cwd: session.cwd,
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        sandboxPolicy: { type: "dangerFullAccess" },
+        activePermissionProfile: null,
+        model,
+        modelProvider: "openai",
+        serviceTier: "default",
+        effort,
+        summary: null,
+        collaborationMode: {
+          mode: "default",
+          settings: {
+            model,
+            reasoning_effort: effort,
+            developer_instructions: null,
+          },
+        },
+        multiAgentMode: "explicitRequestOnly",
+        personality: null,
+      },
+    });
+  }
+
+  private async requireSavedPrimeThread(
+    threadId: string,
+  ): Promise<PrimeSavedSession> {
+    const sessionId = parsePrimeThreadId(threadId);
+    if (!sessionId) throw new Error(`Not a Prime thread: ${threadId}`);
+    const saved = await this.catalog.find(sessionId);
+    if (!saved) throw new Error(`Prime Agent session not found: ${sessionId}`);
+    return saved;
+  }
+
+  private uiModel(state: PrimeState): string {
+    const model = modelFromState(state);
+    return this.options.mode === "hybrid"
+      ? `${PRIME_MODEL_PREFIX}${model}`
+      : model;
+  }
+}

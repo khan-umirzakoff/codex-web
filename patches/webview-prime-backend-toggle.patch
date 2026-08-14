@@ -1,0 +1,10 @@
+--- a/webview/index.html
++++ b/webview/index.html
+@@ -5,6 +5,7 @@
+     <base href="/" />
+     <!-- PROD_CSP_TAG_HERE -->
+     <script type="module" src="./assets/preload.js"></script>
++    <script defer src="./primecodex-ui.js"></script>
+     <meta charset="UTF-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>Codex</title>

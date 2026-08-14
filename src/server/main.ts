@@ -17,6 +17,15 @@ import fastifyMultipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import { installModuleAliasHook } from "./module";
 import { glob } from "glob";
+import { CodexBackend } from "./backends/codex";
+import { PrimeAgentBackend } from "./backends/prime";
+import { PrimeSessionCatalog } from "./prime/catalog";
+import { registerPrimeAgentRoutes } from "./prime/routes";
+import {
+  parseNewThreadBackend,
+  readPrimeCodexControlState,
+  writePrimeCodexControlState,
+} from "./primecodex-control";
 
 type ServerOptions = {
   host: string;
@@ -378,6 +387,115 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
   const app = Fastify({ logger: false });
   const websocketServer = new WebSocketServer({ noServer: true });
   const sockets = new Set<WebSocket>();
+  const codexBackend = new CodexBackend();
+  const primeBackend = new PrimeAgentBackend();
+  const primeSessionCatalog = new PrimeSessionCatalog();
+  const primeCodexMode = process.env.PRIMECODEX_BACKEND ?? "codex";
+  const primeCodexControlFile =
+    process.env.PRIMECODEX_CONTROL_FILE?.trim() ||
+    path.join(os.tmpdir(), `primecodex-control-${process.pid}.json`);
+  const initialNewThreadBackend = parseNewThreadBackend(
+    process.env.PRIMECODEX_NEW_THREAD_BACKEND,
+    primeCodexMode === "prime" ? "prime" : "codex",
+  );
+  process.env.PRIMECODEX_CONTROL_FILE = primeCodexControlFile;
+  await writePrimeCodexControlState(primeCodexControlFile, {
+    activeBackend: initialNewThreadBackend,
+    newThreadBackend: initialNewThreadBackend,
+  });
+
+  app.addHook("onClose", async () => {
+    await Promise.all([codexBackend.close(), primeBackend.close()]);
+    await fs.rm(primeCodexControlFile, { force: true });
+  });
+
+  app.get("/__backend/agent-backends", async () => ({
+    backends: await Promise.all([
+      codexBackend.getInfo(),
+      primeBackend.getInfo(),
+    ]),
+  }));
+  registerPrimeAgentRoutes(app, primeBackend);
+  app.get("/__backend/primecodex/control", async () => {
+    const control = await readPrimeCodexControlState(primeCodexControlFile, {
+      activeBackend: initialNewThreadBackend,
+      newThreadBackend: initialNewThreadBackend,
+    });
+    return {
+      enabled: primeCodexMode === "hybrid",
+      mode: primeCodexMode,
+      ...control,
+    };
+  });
+  app.post("/__backend/primecodex/control", async (request, reply) => {
+    if (primeCodexMode !== "hybrid") {
+      return reply.code(409).send({
+        error: `Backend selection is fixed to ${primeCodexMode}`,
+      });
+    }
+    const body =
+      request.body && typeof request.body === "object"
+        ? (request.body as Record<string, unknown>)
+        : {};
+    if (
+      body.newThreadBackend !== undefined &&
+      body.newThreadBackend !== "codex" &&
+      body.newThreadBackend !== "prime"
+    ) {
+      return reply.code(400).send({
+        error: "newThreadBackend must be codex or prime",
+      });
+    }
+    const current = await readPrimeCodexControlState(primeCodexControlFile, {
+      activeBackend: initialNewThreadBackend,
+      newThreadBackend: initialNewThreadBackend,
+    });
+    const next = { ...current };
+    if (
+      body.activeBackend !== undefined &&
+      body.activeBackend !== "codex" &&
+      body.activeBackend !== "prime"
+    ) {
+      return reply.code(400).send({
+        error: "activeBackend must be codex or prime",
+      });
+    }
+    if (body.activeBackend === "codex" || body.activeBackend === "prime") {
+      next.activeBackend = body.activeBackend;
+    }
+    if (
+      body.newThreadBackend === "codex" ||
+      body.newThreadBackend === "prime"
+    ) {
+      next.newThreadBackend = body.newThreadBackend;
+    }
+    if (body.selectedProjectId === null) delete next.selectedProjectId;
+    else if (typeof body.selectedProjectId === "string")
+      next.selectedProjectId = body.selectedProjectId;
+    if (body.projectCwd === null) delete next.projectCwd;
+    else if (typeof body.projectCwd === "string")
+      next.projectCwd = body.projectCwd;
+    if (body.projectRoots === null) delete next.projectRoots;
+    else if (Array.isArray(body.projectRoots)) {
+      const roots = body.projectRoots.filter(
+        (value): value is string =>
+          typeof value === "string" && value.length > 0,
+      );
+      if (roots.length > 0) next.projectRoots = roots;
+      else delete next.projectRoots;
+    }
+    await writePrimeCodexControlState(primeCodexControlFile, next);
+    return {
+      enabled: true,
+      mode: primeCodexMode,
+      ...next,
+    };
+  });
+  app.get("/__backend/primecodex/sessions", async () => ({
+    primeThreadIds: (await primeSessionCatalog.list()).map(
+      (session) => session.sessionId,
+    ),
+  }));
 
   await app.register(fastifyMultipart, {
     limits: {

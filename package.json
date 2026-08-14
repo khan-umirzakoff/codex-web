@@ -19,7 +19,10 @@
     "build:server": "cd src/server && tsc",
     "prepare:asar": "./scripts/prepare_asar",
     "preserver": "npm run build:server && npm run build:browser",
-    "server": "CODEX_CLI_PATH=$(which codex) node src/server/main.js"
+    "server": "CODEX_CLI_PATH=$(which codex) node src/server/main.js",
+    "server:prime": "PRIMECODEX_BACKEND=prime PRIMECODEX_NEW_THREAD_BACKEND=prime CODEX_APP_SERVER_FORCE_CLI=1 CODEX_CLI_PATH=$PWD/bin/primecodex-codex node src/server/main.js",
+    "server:hybrid": "PRIMECODEX_BACKEND=hybrid CODEX_APP_SERVER_FORCE_CLI=1 CODEX_CLI_PATH=$PWD/bin/primecodex-codex node src/server/main.js",
+    "primecodex": "npm run build:server && npm run server:hybrid"
   },
   "repository": "git@github.com:0xcaff/codex-web.git",
   "author": "martin <martincharles07@gmail.com>",

@@ -1,0 +1,44 @@
+--- a/webview/assets/app-initial~app-main~hotkey-window-new-thread-page~hotkey-window-home-page~composer-utility-bar-D6Thfq3g.js
++++ b/webview/assets/app-initial~app-main~hotkey-window-new-thread-page~hotkey-window-home-page~composer-utility-bar-D6Thfq3g.js
+@@ -7824,6 +7824,41 @@
+     s = (0, Ng.default)(t ?? [], (e) => e.label),
+     c = new Map();
+   for (let e of n) e.projectKind === `local` && mg(e) && c.set(U(e.path), e);
++  if (a?.threadProjectAssignments != null) {
++    let t = new Map(),
++      n = new Set();
++    for (let r of e) {
++      if (
++        r.kind !== `local` ||
++        r.pendingWorktree != null ||
++        r.conversationId == null ||
++        !r.cwd
++      )
++        continue;
++      let i = a.threadProjectAssignments[r.conversationId];
++      if (i == null || i.projectKind !== `local`) continue;
++      let o = U(r.cwd),
++        s = t.get(o);
++      s == null ? t.set(o, i) : s.projectId !== i.projectId && n.add(o);
++    }
++    if (t.size > 0) {
++      let r = { ...a.threadProjectAssignments };
++      for (let i of e) {
++        if (
++          i.kind !== `local` ||
++          i.pendingWorktree != null ||
++          i.conversationId == null ||
++          !i.cwd ||
++          r[i.conversationId] != null
++        )
++          continue;
++        let o = U(i.cwd),
++          s = t.get(o);
++        s != null && !n.has(o) && (r[i.conversationId] = s);
++      }
++      a = { ...a, threadProjectAssignments: r };
++    }
++  }
+   for (let e of n) {
+     if (e.projectKind !== `local` || !mg(e) || e.pathAlias == null) continue;
+     let t = U(e.pathAlias);

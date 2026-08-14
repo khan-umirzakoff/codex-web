@@ -4,6 +4,69 @@ a browser frontend for codex desktop, running on a machine you control.
 
 https://github.com/user-attachments/assets/0a33cbd8-741c-412c-9e75-46dfe9324596
 
+## PrimeCodex hybrid mode
+
+This fork can keep the original Codex web UI while routing each new task to
+either native Codex or Prime Agent.
+
+```bash
+npm install
+npm run primecodex
+```
+
+Then open <http://127.0.0.1:8214>.
+
+On the composer, the backend pill immediately before the reasoning control
+shows `Codex` or `Prime`. It is an app-level context switch: Codex mode shows
+Codex sessions and creates Codex tasks, while Prime mode shows Prime Agent
+sessions and creates Prime tasks. Switching is client-side and does not reload
+the page. Prime mode expands the sidebar history so all available non-archived
+Prime sessions are surfaced.
+
+Internally, creation of a visible Prime task is still armed as a one-shot
+request so invisible Codex helper threads (for example title generation) stay
+on native Codex. The visible `Prime` app mode remains selected and automatically
+re-arms Prime creation when the user returns to the new-task screen.
+
+Existing Prime Agent root sessions are indexed directly from Prime Agent's
+session store, grouped in the normal Codex project sidebar, and can be reopened
+from there. The inactive backend's rows are hidden without a browser refresh.
+Prime tasks use Prime Agent's own
+session persistence, reasoning effort, streaming events, command/tool events,
+and daemon attachment when an already-running session is reopened.
+
+### Syncing this fork with codex-web
+
+Keep this repository's `origin` pointed at the fork and `upstream` pointed at
+`0xcaff/codex-web`. To bring upstream changes into PrimeCodex:
+
+```bash
+git fetch upstream
+git checkout main
+git merge upstream/main
+npm run build:server
+npm run build:browser
+git push origin main
+```
+
+Most PrimeCodex changes live in the compatibility bridge, server additions,
+and small renderer patches, so upstream updates can normally be merged while
+preserving the Prime Agent integration. If an upstream Codex renderer update
+changes a patched bundle, resolve/regenerate the affected patch before pushing.
+
+Prime Agent must already be installed and authenticated. Override its command
+or defaults when needed:
+
+```bash
+PRIME_AGENT_CLI_PATH=/path/to/prime-agent \
+PRIMECODEX_PRIME_THINKING=xhigh \
+npm run primecodex
+```
+
+Prime Agent executes with the current user's permissions; this UI is not a
+security sandbox. Keep the default localhost bind for local use. Put a private
+authenticated tunnel such as Tailscale in front of it before remote access.
+
 ## motivation
 
 the agents were never meant to stay trapped in a terminal window for long.
@@ -133,14 +196,14 @@ talk.
 
 ## alternatives
 
-* [davej/pocodex](https://github.com/davej/pocodex) i used this until the wheels fell off. i needed subagents
+- [davej/pocodex](https://github.com/davej/pocodex) i used this until the wheels fell off. i needed subagents
   and an inline image viewer. this didn't have them and was having a hard time
   keeping up with upstream codex updates.
-* the native codex remote feature (behind a feature flag) is great for
+- the native codex remote feature (behind a feature flag) is great for
   connecting to remote codex hosts over ssh to manage long running tasks but
   this only works if you have codex desktop on your client device. this means it
   doesn't work on mobile.
-* upcoming first party mobile app from openai. `codex-web` exists and works
+- upcoming first party mobile app from openai. `codex-web` exists and works
   today. i can't wait for the mobile app but judging by the other openai mobile
   apps, i'm a little bit skeptical about the quality of the mobile experience.
   time will tell.
