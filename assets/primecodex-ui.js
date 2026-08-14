@@ -2,8 +2,13 @@
   const CONTROL_URL = "/__backend/primecodex/control";
   const SESSIONS_URL = "/__backend/primecodex/sessions";
   const MODE_SWITCH_ATTR = "data-primecodex-mode-switch";
+  const MODE_MENU_ATTR = "data-primecodex-mode-menu";
+  const MODE_SWITCH_VERSION = "native-top-v1";
   let state = null;
   let updating = false;
+  let pendingBackend = null;
+  let modeSwitchObserver = null;
+  let observedModeHeader = null;
   let lastProjectLabel = null;
   let lastPathname = location.pathname;
   let primeThreadIds = new Set();
@@ -202,18 +207,26 @@
   }
 
   async function setBackend(activeBackend) {
-    if (updating) return;
+    closeModeMenu();
+    if (updating) {
+      pendingBackend = activeBackend;
+      return;
+    }
     updating = true;
     try {
-      await syncProjectContext();
+      // Flip the visible/backend state first. Project synchronization can take a
+      // couple of seconds while the Electron global-state bridge wakes up, and
+      // should not make the native-style selector look unresponsive.
       await postControl({
         activeBackend,
         newThreadBackend: activeBackend,
       });
+      render();
+      await syncProjectContext();
       await refreshSessionIndex();
       applySidebarFilter();
       applyModelPickerFilter();
-      await expandPrimeSidebarSessions();
+      void expandPrimeSidebarSessions();
       if (location.pathname !== "/") {
         window.dispatchEvent(
           new MessageEvent("message", {
@@ -224,29 +237,191 @@
     } finally {
       updating = false;
       render();
+      const queuedBackend = pendingBackend;
+      pendingBackend = null;
+      if (queuedBackend && queuedBackend !== state?.activeBackend) {
+        void setBackend(queuedBackend);
+      }
     }
+  }
+
+  function backendLabel(backend) {
+    return backend === "prime" ? "Prime" : "Codex";
+  }
+
+  function backendAccessibleLabel(backend) {
+    return backend === "prime" ? "Prime Agent" : "Codex";
+  }
+
+  function backendDescription(backend) {
+    return backend === "prime"
+      ? "RLM harness and subagents"
+      : "Build, debug, and ship";
+  }
+
+  function closeModeMenu() {
+    const control = document.querySelector(`[${MODE_SWITCH_ATTR}]`);
+    const menu = document.querySelector(`[${MODE_MENU_ATTR}]`);
+    if (!control || !menu) return;
+    menu.hidden = true;
+    const trigger = control.querySelector("[data-primecodex-mode-trigger]");
+    trigger?.setAttribute("aria-expanded", "false");
+  }
+
+  function positionModeMenu(control, menu) {
+    const trigger = control.querySelector("[data-primecodex-mode-trigger]");
+    if (!trigger || menu.hidden) return;
+    const rect = trigger.getBoundingClientRect();
+    menu.style.left = `${Math.round(rect.left)}px`;
+    menu.style.top = `${Math.round(rect.bottom + 4)}px`;
+    menu.style.width = "240px";
+  }
+
+  function toggleModeMenu(control) {
+    const menu = document.querySelector(`[${MODE_MENU_ATTR}]`);
+    if (!menu) return;
+    const opening = menu.hidden;
+    if (!opening) {
+      closeModeMenu();
+      return;
+    }
+    menu.hidden = false;
+    control
+      .querySelector("[data-primecodex-mode-trigger]")
+      ?.setAttribute("aria-expanded", "true");
+    positionModeMenu(control, menu);
+  }
+
+  function checkIcon() {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("aria-hidden", "true");
+    svg.style.width = "16px";
+    svg.style.height = "16px";
+    svg.style.flex = "0 0 auto";
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("fill", "currentColor");
+    path.setAttribute(
+      "d",
+      "M13.03 4.97a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0L2.97 9.53a.75.75 0 0 1 1.06-1.06l2.22 2.22 5.72-5.72a.75.75 0 0 1 1.06 0Z",
+    );
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function chevronIcon() {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("data-primecodex-mode-chevron", "");
+    svg.style.width = "12px";
+    svg.style.height = "12px";
+    svg.classList.add("icon-2xs", "shrink-0", "text-tertiary");
+    svg.style.flex = "0 0 auto";
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("fill", "currentColor");
+    path.setAttribute(
+      "d",
+      "M3.47 5.72a.75.75 0 0 1 1.06 0L8 9.19l3.47-3.47a.75.75 0 1 1 1.06 1.06l-4 4a.75.75 0 0 1-1.06 0l-4-4a.75.75 0 0 1 0-1.06Z",
+    );
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function createModeMenu() {
+    const menu = document.createElement("div");
+    menu.setAttribute(MODE_MENU_ATTR, "");
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", "Agent backend");
+    menu.hidden = true;
+    menu.className =
+      "border-token-border bg-token-main-surface-primary text-token-foreground";
+    menu.style.position = "fixed";
+    menu.style.zIndex = "2147483001";
+    menu.style.boxSizing = "border-box";
+    menu.style.padding = "6px";
+    menu.style.borderWidth = "1px";
+    menu.style.borderStyle = "solid";
+    menu.style.borderRadius = "12px";
+    menu.style.boxShadow = "0 8px 28px rgba(0, 0, 0, 0.18)";
+
+    for (const backend of ["codex", "prime"]) {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.dataset.primecodexBackend = backend;
+      option.setAttribute("role", "menuitemradio");
+      option.className =
+        "text-token-foreground hover:bg-token-list-hover-background";
+      option.style.width = "100%";
+      option.style.display = "flex";
+      option.style.alignItems = "center";
+      option.style.gap = "12px";
+      option.style.padding = "10px 10px";
+      option.style.border = "0";
+      option.style.borderRadius = "8px";
+      option.style.background = "transparent";
+      option.style.font = "inherit";
+      option.style.textAlign = "left";
+      option.style.cursor = "pointer";
+
+      const copy = document.createElement("span");
+      copy.style.display = "flex";
+      copy.style.minWidth = "0";
+      copy.style.flex = "1";
+      copy.style.flexDirection = "column";
+      copy.style.gap = "2px";
+
+      const title = document.createElement("span");
+      title.dataset.primecodexOptionTitle = "";
+      title.textContent = backend === "prime" ? "Prime Agent" : "Codex";
+      title.className = "font-openai-sans";
+      title.style.fontSize = "16px";
+      title.style.lineHeight = "20px";
+      title.style.fontWeight = "500";
+
+      const subtext = document.createElement("span");
+      subtext.textContent = backendDescription(backend);
+      subtext.className = "text-token-description-foreground";
+      subtext.style.fontSize = "13px";
+      subtext.style.lineHeight = "18px";
+      subtext.style.fontWeight = "400";
+
+      copy.append(title, subtext);
+      const check = checkIcon();
+      check.dataset.primecodexModeCheck = "";
+      option.append(copy, check);
+      option.addEventListener("click", () => {
+        closeModeMenu();
+        void setBackend(backend);
+      });
+      menu.appendChild(option);
+    }
+
+    document.body.appendChild(menu);
+    return menu;
   }
 
   function removeModeSwitch() {
     document.querySelector(`[${MODE_SWITCH_ATTR}]`)?.remove();
+    document.querySelector(`[${MODE_MENU_ATTR}]`)?.remove();
+    const scrollArea = document.querySelector(
+      "aside.app-shell-left-panel .vertical-scroll-fade-mask",
+    );
+    if (scrollArea?.style.paddingBottom.includes("52px")) {
+      scrollArea.style.removeProperty("padding-bottom");
+    }
   }
 
-  function styleModeButton(button, active) {
-    button.style.height = "28px";
-    button.style.border = "0";
-    button.style.borderRadius = "8px";
-    button.style.padding = "0 14px";
-    button.style.font = "inherit";
-    button.style.fontSize = "13px";
-    button.style.fontWeight = active ? "500" : "400";
-    button.style.cursor = "pointer";
-    button.style.background = active
-      ? "var(--color-background-elevated-primary)"
-      : "transparent";
-    button.style.color = active
-      ? "var(--color-text-primary, currentColor)"
-      : "var(--color-text-tertiary, currentColor)";
-    button.style.opacity = active ? "1" : "0.72";
+  function observeModeSwitchHeader(header) {
+    if (observedModeHeader === header && modeSwitchObserver) return;
+    modeSwitchObserver?.disconnect();
+    observedModeHeader = header;
+    modeSwitchObserver = new MutationObserver(() => {
+      if (!document.querySelector(`[${MODE_SWITCH_ATTR}]`)) {
+        queueMicrotask(ensureModeSwitch);
+      }
+    });
+    modeSwitchObserver.observe(header, { childList: true });
   }
 
   function ensureModeSwitch() {
@@ -261,57 +436,76 @@
       return;
     }
 
+    const nav = aside.querySelector('nav[role="navigation"]');
+    const header = nav?.firstElementChild;
+    if (!header) {
+      removeModeSwitch();
+      return;
+    }
+    observeModeSwitchHeader(header);
+
     let control = document.querySelector(`[${MODE_SWITCH_ATTR}]`);
+    if (control?.dataset.primecodexModeSwitchVersion !== MODE_SWITCH_VERSION) {
+      removeModeSwitch();
+      control = null;
+    }
+
+    let menu = document.querySelector(`[${MODE_MENU_ATTR}]`);
     if (!control) {
       control = document.createElement("div");
       control.setAttribute(MODE_SWITCH_ATTR, "");
-      control.setAttribute("role", "group");
-      control.setAttribute("aria-label", "Agent backend");
-      control.style.position = "fixed";
-      control.style.display = "grid";
-      control.style.gridTemplateColumns = "1fr 1fr";
-      control.style.gap = "2px";
-      control.style.height = "32px";
-      control.style.padding = "2px";
-      control.style.boxSizing = "border-box";
-      control.style.border = "1px solid var(--color-border)";
-      control.style.borderRadius = "10px";
-      control.style.background = "var(--color-background-control)";
-      control.style.boxShadow = "0 1px 2px rgba(0,0,0,.18)";
-      control.style.zIndex = "2147483000";
+      control.dataset.primecodexModeSwitchVersion = MODE_SWITCH_VERSION;
+      control.className = "ml-2 flex h-8 shrink-0 items-center";
 
-      for (const backend of ["codex", "prime"]) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.dataset.primecodexBackend = backend;
-        button.textContent = backend === "codex" ? "Codex" : "Prime";
-        button.addEventListener("click", () => void setBackend(backend));
-        control.appendChild(button);
-      }
-      document.body.appendChild(control);
+      const trigger = document.createElement("button");
+      trigger.type = "button";
+      trigger.dataset.primecodexModeTrigger = "";
+      trigger.setAttribute("aria-haspopup", "menu");
+      trigger.setAttribute("aria-expanded", "false");
+      trigger.className =
+        "flex h-8 min-w-0 cursor-interaction items-center gap-1 rounded-xl px-2 !text-[17px] !leading-6 font-medium text-token-foreground hover:bg-token-list-hover-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-0";
+      trigger.style.marginInlineStart = "-8px";
+
+      const label = document.createElement("span");
+      label.dataset.primecodexModeLabel = "";
+      label.className =
+        "truncate font-openai-sans font-semibold text-token-foreground";
+      trigger.append(label, chevronIcon());
+      trigger.addEventListener("click", (event) => {
+        event.stopPropagation();
+        toggleModeMenu(control);
+      });
+      control.appendChild(trigger);
+      header.prepend(control);
+      if (!menu) menu = createModeMenu();
+    } else if (control.parentElement !== header) {
+      header.prepend(control);
     }
-
-    const footer = aside.querySelector(
-      ".absolute.inset-x-0.bottom-0.z-20",
-    );
-    const footerTop = footer?.getBoundingClientRect().top ?? asideRect.bottom - 46;
-    const width = Math.min(220, Math.max(160, asideRect.width - 16));
-    control.style.left = `${asideRect.left + 8}px`;
-    control.style.top = `${Math.max(asideRect.top + 8, footerTop - 40)}px`;
-    control.style.width = `${width}px`;
+    if (!menu) menu = createModeMenu();
 
     const scrollArea = aside.querySelector(".vertical-scroll-fade-mask");
-    if (scrollArea) {
-      scrollArea.style.paddingBottom =
-        "calc(var(--sidebar-footer-height, 46px) + 52px)";
+    if (scrollArea?.style.paddingBottom.includes("52px")) {
+      scrollArea.style.removeProperty("padding-bottom");
     }
 
     const activeBackend = state.activeBackend || "codex";
-    for (const button of control.querySelectorAll("button")) {
-      const active = button.dataset.primecodexBackend === activeBackend;
-      styleModeButton(button, active);
-      button.setAttribute("aria-pressed", String(active));
+    const trigger = control.querySelector("[data-primecodex-mode-trigger]");
+    const label = control.querySelector("[data-primecodex-mode-label]");
+    if (label) label.textContent = backendLabel(activeBackend);
+    if (trigger) {
+      trigger.setAttribute(
+        "aria-label",
+        `Switch backend, current backend: ${backendAccessibleLabel(activeBackend)}`,
+      );
     }
+    for (const option of menu.querySelectorAll("[data-primecodex-backend]")) {
+      const active = option.dataset.primecodexBackend === activeBackend;
+      option.setAttribute("aria-checked", String(active));
+      const check = option.querySelector("[data-primecodex-mode-check]");
+      if (check) check.style.visibility = active ? "visible" : "hidden";
+    }
+
+    if (!menu.hidden) positionModeMenu(control, menu);
   }
 
   function render() {
@@ -352,8 +546,27 @@
     await syncProjectContext();
     await armActiveBackendForNewTask();
     render();
+    document.addEventListener("pointerdown", (event) => {
+      const control = document.querySelector(`[${MODE_SWITCH_ATTR}]`);
+      const menu = document.querySelector(`[${MODE_MENU_ATTR}]`);
+      if (!control || !menu || menu.hidden) return;
+      if (!control.contains(event.target) && !menu.contains(event.target)) {
+        closeModeMenu();
+      }
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeModeMenu();
+    });
+    window.addEventListener("resize", () => {
+      const control = document.querySelector(`[${MODE_SWITCH_ATTR}]`);
+      const menu = document.querySelector(`[${MODE_MENU_ATTR}]`);
+      if (control && menu && !menu.hidden) positionModeMenu(control, menu);
+    });
     setInterval(render, 250);
-    setInterval(() => void refreshSessionIndex().then(applySidebarFilter), 3000);
+    setInterval(
+      () => void refreshSessionIndex().then(applySidebarFilter),
+      3000,
+    );
   }
 
   if (document.readyState === "loading") {
