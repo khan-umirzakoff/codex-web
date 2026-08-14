@@ -57,6 +57,13 @@ type PrimeToolRuntime = {
   startedAtMs: number;
 };
 
+type PrimeDiff = {
+  path: string;
+  oldStr: string;
+  newStr: string;
+  startLine?: number;
+};
+
 type PrimeTurnContext = {
   id: string;
   userItem: CodexThreadItem;
@@ -67,6 +74,10 @@ type PrimeTurnContext = {
   agentItem?: CodexThreadItem;
   reasoningItem?: CodexThreadItem;
   tools: Map<string, PrimeToolRuntime>;
+  bashRun?: PrimeToolRuntime & { runId?: string };
+  subagentIds: Set<string>;
+  compactionItem?: CodexThreadItem;
+  lastRecap?: string;
   interrupted: boolean;
   failed: boolean;
   latestUsage?: Record<string, unknown>;
@@ -100,9 +111,84 @@ function contentText(content: unknown): string {
 }
 
 function outputText(value: unknown): string {
+  if (typeof value === "string") return value;
   const record = asRecord(value);
-  const content = record.content;
-  return contentText(content);
+  if (typeof record.output === "string") return record.output;
+  const content = contentText(record.content);
+  if (content) return content;
+  const details = asRecord(record.details);
+  return [details.stdout, details.stderr, details.result]
+    .filter(
+      (part): part is string => typeof part === "string" && part.length > 0,
+    )
+    .join("\n");
+}
+
+function primeDiffs(value: unknown): PrimeDiff[] {
+  const details = asRecord(asRecord(value).details);
+  if (!Array.isArray(details.diffs)) return [];
+  return details.diffs.flatMap((entry) => {
+    const diff = asRecord(entry);
+    if (
+      typeof diff.path !== "string" ||
+      typeof diff.oldStr !== "string" ||
+      typeof diff.newStr !== "string"
+    ) {
+      return [];
+    }
+    return [
+      {
+        path: diff.path,
+        oldStr: diff.oldStr,
+        newStr: diff.newStr,
+        ...(typeof diff.startLine === "number"
+          ? { startLine: diff.startLine }
+          : {}),
+      },
+    ];
+  });
+}
+
+function diffLines(text: string): string[] {
+  if (text.length === 0) return [];
+  const normalized = text.replace(/\r\n/g, "\n");
+  const withoutFinalNewline = normalized.endsWith("\n")
+    ? normalized.slice(0, -1)
+    : normalized;
+  return withoutFinalNewline.split("\n");
+}
+
+function unifiedDiff(diff: PrimeDiff): string {
+  const startLine = Math.max(1, Math.floor(diff.startLine ?? 1));
+  const oldLines = diffLines(diff.oldStr);
+  const newLines = diffLines(diff.newStr);
+  const body = [
+    ...(diff.oldStr.length === 0 ? [] : oldLines.map((line) => `-${line}`)),
+    ...(diff.newStr.length === 0 ? [] : newLines.map((line) => `+${line}`)),
+  ];
+  return [
+    `@@ -${startLine},${oldLines.length} +${startLine},${newLines.length} @@`,
+    ...body,
+  ].join("\n");
+}
+
+function primeFileChangeItem(
+  callId: string,
+  result: unknown,
+  failed: boolean,
+): CodexThreadItem | undefined {
+  const diffs = primeDiffs(result);
+  if (diffs.length === 0) return undefined;
+  return {
+    type: "fileChange",
+    id: `prime-file:${callId}`,
+    status: failed ? "failed" : "completed",
+    changes: diffs.map((diff) => ({
+      path: diff.path,
+      kind: { type: "update", move_path: null },
+      diff: unifiedDiff(diff),
+    })),
+  };
 }
 
 function toolCommand(toolName: string, args: unknown): string {
@@ -753,6 +839,7 @@ export class CodexPrimeBridge {
       ready: false,
       bufferedEvents: [],
       tools: new Map(),
+      subagentIds: new Set(),
       interrupted: false,
       failed: false,
     };
@@ -911,9 +998,47 @@ export class CodexPrimeBridge {
       return;
     }
 
+    if (event.type === "recap_update") {
+      const recap = optionalString(event.recap)?.trim();
+      if (!recap || recap === turn.lastRecap) return;
+      turn.lastRecap = recap;
+      const item = this.ensureReasoningItem(threadId, turn);
+      const summary = Array.isArray(item.summary) ? item.summary : [""];
+      const prefix =
+        typeof summary[0] === "string" && summary[0].length > 0 ? "\n" : "";
+      const delta = `${prefix}${recap}`;
+      summary[0] = `${typeof summary[0] === "string" ? summary[0] : ""}${delta}`;
+      item.summary = summary;
+      notify("item/reasoning/summaryTextDelta", {
+        threadId,
+        turnId: turn.id,
+        itemId: item.id,
+        delta,
+        summaryIndex: 0,
+      });
+      return;
+    }
+
     if (event.type === "message_end") {
       const message = asRecord(event.message);
       if (message.role === "assistant") {
+        const thinkingText = Array.isArray(message.content)
+          ? message.content
+              .map((entry) => asRecord(entry))
+              .filter(
+                (entry) =>
+                  entry.type === "thinking" &&
+                  typeof entry.thinking === "string",
+              )
+              .map((entry) => String(entry.thinking))
+              .filter(Boolean)
+              .join("\n")
+          : "";
+        if (thinkingText) {
+          const item =
+            turn.reasoningItem ?? this.ensureReasoningItem(threadId, turn);
+          item.summary = [thinkingText];
+        }
         if (turn.agentItem) {
           const fullText = contentText(message.content);
           if (fullText) turn.agentItem.text = fullText;
@@ -968,6 +1093,7 @@ export class CodexPrimeBridge {
       const runtime = turn.tools.get(callId);
       if (!runtime) return;
       const nextOutput = outputText(event.partialResult);
+      if (!nextOutput) return;
       const delta = nextOutput.startsWith(runtime.output)
         ? nextOutput.slice(runtime.output.length)
         : nextOutput;
@@ -991,12 +1117,211 @@ export class CodexPrimeBridge {
       if (!runtime) return;
       const finalOutput = outputText(event.result) || runtime.output;
       const isError = event.isError === true;
-      runtime.item.aggregatedOutput = finalOutput;
+      runtime.item.aggregatedOutput = finalOutput || null;
       runtime.item.status = isError ? "failed" : "completed";
       runtime.item.exitCode = isError ? 1 : 0;
       runtime.item.durationMs = Date.now() - runtime.startedAtMs;
       this.completeItem(threadId, turn, runtime.item);
       turn.tools.delete(callId);
+
+      const fileChange = primeFileChangeItem(callId, event.result, isError);
+      if (fileChange) {
+        const startedAtMs = runtime.startedAtMs;
+        notify("item/started", {
+          item: { ...fileChange, status: "inProgress" },
+          threadId,
+          turnId: turn.id,
+          startedAtMs,
+        });
+        this.completeItem(threadId, turn, fileChange);
+      }
+      return;
+    }
+
+    if (event.type === "bash_start") {
+      if (event.transient === true) return;
+      const runId = optionalString(event.runId);
+      const item: CodexThreadItem = {
+        type: "commandExecution",
+        id: `prime-bash:${runId ?? randomUUID()}`,
+        pluginId: null,
+        scriptPath: null,
+        command: optionalString(event.command) ?? "bash",
+        cwd: session.cwd,
+        processId: null,
+        source: "agent",
+        status: "inProgress",
+        commandActions: [],
+        aggregatedOutput: null,
+        exitCode: null,
+        durationMs: null,
+      };
+      const startedAtMs = Date.now();
+      turn.bashRun = {
+        item,
+        output: "",
+        startedAtMs,
+        ...(runId ? { runId } : {}),
+      };
+      notify("item/started", {
+        item,
+        threadId,
+        turnId: turn.id,
+        startedAtMs,
+      });
+      return;
+    }
+
+    if (event.type === "bash_output") {
+      const runtime = turn.bashRun;
+      if (!runtime) return;
+      const delta = optionalString(event.chunk) ?? "";
+      if (!delta) return;
+      runtime.output += delta;
+      runtime.item.aggregatedOutput = runtime.output;
+      notify("item/commandExecution/outputDelta", {
+        threadId,
+        turnId: turn.id,
+        itemId: runtime.item.id,
+        delta,
+      });
+      return;
+    }
+
+    if (event.type === "bash_end") {
+      const runtime = turn.bashRun;
+      if (!runtime) return;
+      const exitCode = numberOrNull(event.exitCode);
+      const cancelled = event.cancelled === true;
+      const errorMessage = optionalString(event.errorMessage);
+      if (errorMessage) {
+        const prefix =
+          runtime.output && !runtime.output.endsWith("\n") ? "\n" : "";
+        runtime.output += `${prefix}${errorMessage}`;
+      }
+      runtime.item.aggregatedOutput = runtime.output || null;
+      runtime.item.status =
+        exitCode === 0 && !cancelled ? "completed" : "failed";
+      runtime.item.exitCode = exitCode ?? (cancelled ? 130 : 1);
+      runtime.item.durationMs = Date.now() - runtime.startedAtMs;
+      this.completeItem(threadId, turn, runtime.item);
+      turn.bashRun = undefined;
+      return;
+    }
+
+    if (event.type === "compaction_start") {
+      if (turn.compactionItem) return;
+      const item: CodexThreadItem = {
+        type: "contextCompaction",
+        id: `prime-compaction:${randomUUID()}`,
+        completed: false,
+        source: event.reason === "manual" ? "manual" : "automatic",
+      };
+      turn.compactionItem = item;
+      notify("item/started", {
+        item,
+        threadId,
+        turnId: turn.id,
+        startedAtMs: Date.now(),
+      });
+      return;
+    }
+
+    if (event.type === "compaction_end") {
+      const item = turn.compactionItem ?? {
+        type: "contextCompaction",
+        id: `prime-compaction:${randomUUID()}`,
+        completed: false,
+        source: event.reason === "manual" ? "manual" : "automatic",
+      };
+      if (!turn.compactionItem) {
+        notify("item/started", {
+          item,
+          threadId,
+          turnId: turn.id,
+          startedAtMs: Date.now(),
+        });
+      }
+      item.completed = true;
+      this.completeItem(threadId, turn, item);
+      turn.compactionItem = undefined;
+      return;
+    }
+
+    if (event.type === "rlm_child_update") {
+      const child = asRecord(event.child);
+      const childId = optionalString(child.id);
+      if (!childId) return;
+      const status = optionalString(child.status) ?? "running";
+      const itemId = `prime-subagent:${childId}`;
+      const agentThreadId =
+        optionalString(child.activeSessionId) ??
+        optionalString(child.sessionName) ??
+        childId;
+      const label =
+        optionalString(child.sessionName) ??
+        optionalString(child.label) ??
+        `agent-${childId.slice(0, 8)}`;
+      const first = !turn.subagentIds.has(childId);
+      turn.subagentIds.add(childId);
+      const item: CodexThreadItem = {
+        type: "subAgentActivity",
+        id: itemId,
+        agentThreadId,
+        agentPath: `root/${label}`,
+        kind:
+          status === "cancelled"
+            ? "interrupted"
+            : first
+              ? "started"
+              : "interacted",
+      };
+      const existingIndex = turn.items.findIndex(
+        (entry) => entry.id === itemId,
+      );
+      if (existingIndex >= 0) turn.items[existingIndex] = { ...item };
+      else turn.items.push({ ...item });
+      notify("item/completed", {
+        item,
+        threadId,
+        turnId: turn.id,
+        completedAtMs: Date.now(),
+      });
+      return;
+    }
+
+    if (event.type === "ipython_sent_agent_message") {
+      const message = asRecord(event.message);
+      const target = asRecord(message.target);
+      const targetName =
+        optionalString(target.sessionName) ??
+        optionalString(target.sessionId) ??
+        "agent";
+      const body = optionalString(message.message) ?? "";
+      const delivery = optionalString(message.deliveryStatus) ?? "sent";
+      const callId = optionalString(event.toolCallId) ?? randomUUID();
+      const item: CodexThreadItem = {
+        type: "commandExecution",
+        id: `prime-agent-message:${callId}:${randomUUID()}`,
+        pluginId: null,
+        scriptPath: null,
+        command: `agent_message.send → ${targetName}`,
+        cwd: session.cwd,
+        processId: null,
+        source: "agent",
+        status: "completed",
+        commandActions: [],
+        aggregatedOutput: body ? `${delivery}: ${body}` : delivery,
+        exitCode: 0,
+        durationMs: 0,
+      };
+      notify("item/started", {
+        item: { ...item, status: "inProgress" },
+        threadId,
+        turnId: turn.id,
+        startedAtMs: Date.now(),
+      });
+      this.completeItem(threadId, turn, item);
       return;
     }
 
@@ -1071,6 +1396,21 @@ export class CodexPrimeBridge {
       this.completeItem(session.threadId, turn, runtime.item);
     }
     turn.tools.clear();
+
+    if (turn.bashRun) {
+      turn.bashRun.item.status = turn.interrupted ? "failed" : "completed";
+      turn.bashRun.item.exitCode = turn.interrupted ? 130 : 0;
+      turn.bashRun.item.durationMs = Date.now() - turn.bashRun.startedAtMs;
+      turn.bashRun.item.aggregatedOutput = turn.bashRun.output || null;
+      this.completeItem(session.threadId, turn, turn.bashRun.item);
+      turn.bashRun = undefined;
+    }
+
+    if (turn.compactionItem) {
+      turn.compactionItem.completed = true;
+      this.completeItem(session.threadId, turn, turn.compactionItem);
+      turn.compactionItem = undefined;
+    }
 
     if (turn.agentItem) {
       this.completeItem(session.threadId, turn, turn.agentItem);

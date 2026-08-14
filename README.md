@@ -35,6 +35,12 @@ Prime tasks use Prime Agent's own
 session persistence, reasoning effort, streaming events, command/tool events,
 and daemon attachment when an already-running session is reopened.
 
+Live Prime activity is translated into Codex-native timeline items instead of
+dumping the Prime TUI trace into chat. Reasoning and recaps use collapsed
+reasoning entries; IPython/bash work uses command cards with expandable output;
+IPython file diffs use normal Codex patch cards; and RLM child updates surface
+as subagent activity.
+
 ### Syncing this fork with codex-web
 
 Keep this repository's `origin` pointed at the fork and `upstream` pointed at
