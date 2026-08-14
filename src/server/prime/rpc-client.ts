@@ -37,6 +37,7 @@ export type PrimeAgentRpcClientOptions = {
   model?: string;
   thinking?: PrimeThinkingLevel;
   resume?: string;
+  fork?: string;
 };
 
 type PendingRequest = {
@@ -76,6 +77,9 @@ export class PrimeAgentRpcClient {
     }
     if (this.options.resume) {
       args.push("--resume", this.options.resume);
+    }
+    if (this.options.fork) {
+      args.push("--fork", this.options.fork);
     }
 
     const child = spawn(this.options.command, args, {
@@ -143,6 +147,23 @@ export class PrimeAgentRpcClient {
       });
     });
     this.process = null;
+  }
+
+  async killResidentSession(): Promise<boolean> {
+    const daemon = this.daemon;
+    if (!daemon) return false;
+    this.daemon = null;
+    await daemon.kill();
+    return true;
+  }
+
+  static async killResident(
+    options: PrimeAgentRpcClientOptions,
+  ): Promise<boolean> {
+    const daemon = await PrimeAgentDaemonRpcClient.tryCreate(options);
+    if (!daemon) return false;
+    await daemon.kill();
+    return true;
   }
 
   onEvent(listener: (event: PrimeRpcEvent) => void): () => void {

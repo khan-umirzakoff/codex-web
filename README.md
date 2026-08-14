@@ -33,7 +33,12 @@ session store, grouped in the normal Codex project sidebar, and can be reopened
 from there. The inactive backend's rows are hidden without a browser refresh.
 Prime tasks use Prime Agent's own
 session persistence, reasoning effort, streaming events, command/tool events,
-and daemon attachment when an already-running session is reopened.
+and daemon attachment when an already-running session is reopened. Native
+Codex task lifecycle actions are mapped for Prime threads too: continue/fork
+(including historical-turn and worktree forks), archive/unarchive, ephemeral
+side tasks, and rich composer context such as attached files and local images.
+Side-task developer instructions are persisted as hidden Prime context, and
+closing a side task removes its ephemeral Prime backing session.
 
 Live Prime activity is translated into Codex-native timeline items instead of
 dumping the Prime TUI trace into chat. Reasoning and recaps use collapsed

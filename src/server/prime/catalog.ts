@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -208,5 +209,118 @@ export class PrimeSessionCatalog {
     return (await this.list()).find(
       (session) => session.sessionId === sessionId,
     );
+  }
+
+  async setArchived(sessionId: string, archived: boolean): Promise<void> {
+    const saved = await this.find(sessionId);
+    if (!saved) throw new Error(`Prime Agent session not found: ${sessionId}`);
+
+    const source = await fs.readFile(saved.filePath, "utf8");
+    const ids = new Set<string>();
+    let leafId: string | null = null;
+    for (const line of source.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line) as PrimeEntry;
+        if (entry.type !== "session" && entry.id) {
+          ids.add(entry.id);
+          leafId = entry.id;
+        }
+      } catch {
+        // Match Prime Agent's tolerant JSONL loader.
+      }
+    }
+
+    let id = randomBytes(4).toString("hex");
+    while (ids.has(id)) id = randomBytes(4).toString("hex");
+    const entry = {
+      type: "session_state",
+      id,
+      parentId: leafId,
+      timestamp: new Date().toISOString(),
+      state: { status: archived ? "archived" : "active" },
+    };
+    await fs.appendFile(saved.filePath, `${JSON.stringify(entry)}\n`, "utf8");
+  }
+
+  async delete(sessionId: string): Promise<void> {
+    const saved = await this.find(sessionId);
+    if (!saved) return;
+    await fs.rm(saved.filePath, { force: true });
+    await fs.rm(
+      path.resolve(this.sessionDir, "..", "session-artifacts", sessionId),
+      {
+        recursive: true,
+        force: true,
+      },
+    );
+  }
+
+  async reparent(sessionId: string, parentSession: string): Promise<void> {
+    const saved = await this.find(sessionId);
+    if (!saved) throw new Error(`Prime Agent session not found: ${sessionId}`);
+
+    const source = await fs.readFile(saved.filePath, "utf8");
+    const lines = source.split("\n");
+    let replaced = false;
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (!line?.trim()) continue;
+      try {
+        const entry = JSON.parse(line) as Record<string, unknown>;
+        if (entry.type !== "session") continue;
+        lines[index] = JSON.stringify({ ...entry, parentSession });
+        replaced = true;
+        break;
+      } catch {
+        // Keep malformed records untouched, matching Prime's tolerant loader.
+      }
+    }
+    if (!replaced) {
+      throw new Error(`Prime Agent session header not found: ${sessionId}`);
+    }
+
+    const tempPath = `${saved.filePath}.primecodex-${process.pid}.tmp`;
+    await fs.writeFile(tempPath, lines.join("\n"), "utf8");
+    await fs.rename(tempPath, saved.filePath);
+  }
+
+  async appendContextMessage(
+    sessionId: string,
+    customType: string,
+    content: string,
+  ): Promise<void> {
+    const saved = await this.find(sessionId);
+    if (!saved) throw new Error(`Prime Agent session not found: ${sessionId}`);
+
+    const source = await fs.readFile(saved.filePath, "utf8");
+    const ids = new Set<string>();
+    let leafId: string | null = null;
+    for (const line of source.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line) as PrimeEntry;
+        if (entry.type !== "session" && entry.id) {
+          ids.add(entry.id);
+          leafId = entry.id;
+        }
+      } catch {
+        // Match Prime Agent's tolerant JSONL loader.
+      }
+    }
+
+    let id = randomBytes(4).toString("hex");
+    while (ids.has(id)) id = randomBytes(4).toString("hex");
+    const entry = {
+      type: "custom_message",
+      customType,
+      content,
+      display: false,
+      details: { source: "primecodex" },
+      id,
+      parentId: leafId,
+      timestamp: new Date().toISOString(),
+    };
+    await fs.appendFile(saved.filePath, `${JSON.stringify(entry)}\n`, "utf8");
   }
 }

@@ -68,7 +68,10 @@ export class PrimeAgentDaemonRpcClient {
   static async tryCreate(
     options: PrimeAgentRpcClientOptions,
   ): Promise<PrimeAgentDaemonRpcClient | undefined> {
-    if (!options.resume) return undefined;
+    // Forking must create an independent runtime. Attaching to a resident
+    // daemon session and then invoking Prime's in-session fork would replace
+    // the source runtime, which breaks Codex side-task/fork semantics.
+    if (!options.resume || options.fork) return undefined;
 
     let client: DaemonClientLike | undefined;
     try {
@@ -174,6 +177,23 @@ export class PrimeAgentDaemonRpcClient {
       // Closing the socket also releases this non-owning attachment.
     }
     this.client.close();
+  }
+
+  async kill(): Promise<void> {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.unsubscribeDaemon();
+    try {
+      const response = await this.client.request(
+        { type: "kill", activeSessionId: this.activeSessionId },
+        10_000,
+      );
+      if (!response.success) {
+        throw new Error(response.error ?? "Prime Agent daemon kill failed");
+      }
+    } finally {
+      this.client.close();
+    }
   }
 
   async request(

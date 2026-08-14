@@ -32,7 +32,7 @@ export type CodexThread = {
   id: string;
   extra: null;
   sessionId: string;
-  forkedFromId: null;
+  forkedFromId: string | null;
   parentThreadId: null;
   preview: string;
   ephemeral: boolean;

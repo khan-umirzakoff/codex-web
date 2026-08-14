@@ -1,5 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import { extname } from "node:path";
 import {
   type CodexRequest,
   type CodexThread,
@@ -64,6 +66,12 @@ type PrimeDiff = {
   startLine?: number;
 };
 
+type PrimeImageContent = {
+  type: "image";
+  data: string;
+  mimeType: string;
+};
+
 type PrimeTurnContext = {
   id: string;
   userItem: CodexThreadItem;
@@ -108,6 +116,94 @@ function contentText(content: unknown): string {
     })
     .map((entry) => String(asRecord(entry).text))
     .join("");
+}
+
+function imageMimeType(filePath: string): string | undefined {
+  switch (extname(filePath).toLowerCase()) {
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".webp":
+      return "image/webp";
+    case ".gif":
+      return "image/gif";
+    default:
+      return undefined;
+  }
+}
+
+async function primeInput(
+  input: unknown[],
+): Promise<{ message: string; images: PrimeImageContent[] }> {
+  const text: string[] = [];
+  const images: PrimeImageContent[] = [];
+
+  for (const raw of input) {
+    const entry = asRecord(raw);
+    switch (entry.type) {
+      case "text":
+        if (typeof entry.text === "string" && entry.text) text.push(entry.text);
+        break;
+      case "mention": {
+        const filePath = optionalString(entry.path);
+        if (filePath) {
+          const name = optionalString(entry.name);
+          text.push(`Attached file${name ? ` ${name}` : ""}: ${filePath}`);
+        }
+        break;
+      }
+      case "skill": {
+        const skillPath = optionalString(entry.path);
+        const name = optionalString(entry.name);
+        if (skillPath) {
+          text.push(`Attached skill${name ? ` ${name}` : ""}: ${skillPath}`);
+        }
+        break;
+      }
+      case "localImage": {
+        const imagePath = optionalString(entry.path);
+        const mimeType = imagePath ? imageMimeType(imagePath) : undefined;
+        if (imagePath && mimeType) {
+          const data = await fs
+            .readFile(imagePath)
+            .then((value) => value.toString("base64"));
+          images.push({ type: "image", data, mimeType });
+        } else if (imagePath) {
+          text.push(`Attached image file: ${imagePath}`);
+        }
+        break;
+      }
+      case "image": {
+        const url = optionalString(entry.url);
+        const match = url?.match(/^data:(image\/[^;]+);base64,(.+)$/s);
+        if (match?.[1] && match[2]) {
+          images.push({ type: "image", mimeType: match[1], data: match[2] });
+        } else if (url) {
+          text.push(`Attached image URL: ${url}`);
+        }
+        break;
+      }
+      case "localAudio": {
+        const audioPath = optionalString(entry.path);
+        if (audioPath) text.push(`Attached audio file: ${audioPath}`);
+        break;
+      }
+      case "audio": {
+        const url = optionalString(entry.url);
+        if (url) text.push(`Attached audio URL: ${url}`);
+        break;
+      }
+    }
+  }
+
+  return {
+    message:
+      text.join("\n").trim() ||
+      (images.length > 0 ? "Please review the attached image." : ""),
+    images,
+  };
 }
 
 function outputText(value: unknown): string {
@@ -360,6 +456,7 @@ export class CodexPrimeBridge {
   private readonly codex: RealCodexProxy;
   private readonly catalog = new PrimeSessionCatalog();
   private readonly livePrimeThreads = new Map<string, PrimeCompatSession>();
+  private readonly ephemeralPrimeThreads = new Set<string>();
   private pendingPrimeCwd: string | undefined;
 
   constructor(private readonly options: CodexPrimeBridgeOptions) {
@@ -668,6 +765,18 @@ export class CodexPrimeBridge {
       case "thread/name/set":
         await this.handlePrimeThreadName(id, threadId, params);
         return;
+      case "thread/archive":
+        await this.handlePrimeThreadArchive(id, threadId);
+        return;
+      case "thread/unarchive":
+        await this.handlePrimeThreadUnarchive(id, threadId);
+        return;
+      case "thread/fork":
+        await this.handlePrimeThreadFork(id, threadId, params);
+        return;
+      case "thread/unsubscribe":
+        await this.handlePrimeThreadUnsubscribe(id, threadId);
+        return;
       case "turn/start":
         await this.handlePrimeTurnStart(id, threadId, params);
         return;
@@ -789,6 +898,241 @@ export class CodexPrimeBridge {
     notify("thread/name/updated", { threadId, threadName: name });
   }
 
+  private async handlePrimeThreadArchive(
+    id: JsonRpcId,
+    threadId: string,
+  ): Promise<void> {
+    const saved = await this.requireSavedPrimeThread(threadId);
+    const live = this.livePrimeThreads.get(threadId);
+    if (live?.currentTurn) {
+      await live.client.request({ type: "abort" }).catch(() => undefined);
+    }
+
+    let daemonArchived = false;
+    if (live) {
+      daemonArchived = await live.client.killResidentSession();
+      if (!daemonArchived) await live.client.stop();
+      this.livePrimeThreads.delete(threadId);
+    } else {
+      daemonArchived = await PrimeAgentRpcClient.killResident({
+        command: this.options.primeCommand,
+        cwd: saved.cwd,
+        resume: saved.sessionId,
+      });
+    }
+    if (!daemonArchived) await this.catalog.setArchived(saved.sessionId, true);
+
+    rpcResult(id, {});
+    notify("thread/archived", { threadId });
+  }
+
+  private async handlePrimeThreadUnarchive(
+    id: JsonRpcId,
+    threadId: string,
+  ): Promise<void> {
+    const saved = await this.requireSavedPrimeThread(threadId);
+    await this.catalog.setArchived(saved.sessionId, false);
+    const refreshed = await this.requireSavedPrimeThread(threadId);
+    const thread = threadFromPrimeSession(refreshed, { loaded: false });
+    rpcResult(id, { thread });
+    notify("thread/unarchived", { threadId });
+  }
+
+  private async handlePrimeThreadFork(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const source = await this.requireSavedPrimeThread(threadId);
+    const cwd = optionalString(params.cwd) ?? source.cwd;
+    const requestedModel = primeModelId(params.model) ?? source.model;
+    const requestedThinking =
+      toPrimeThinking(params.effort) ??
+      (source.thinking as PrimeThinkingLevel | undefined);
+    let client = new PrimeAgentRpcClient({
+      command: this.options.primeCommand,
+      cwd,
+      fork: source.filePath,
+      ...(source.provider ? { provider: primeProvider(source.provider) } : {}),
+      ...(requestedModel ? { model: requestedModel } : {}),
+      ...(requestedThinking ? { thinking: requestedThinking } : {}),
+    });
+
+    await client.start();
+    try {
+      let state = asRecord(
+        (await client.request({ type: "get_state" })).data,
+      ) as PrimeState;
+      const intermediateSessionId = state.sessionId;
+
+      const beforeTurnId = optionalString(params.beforeTurnId);
+      const lastTurnId = optionalString(params.lastTurnId);
+      if (beforeTurnId && lastTurnId) {
+        throw new Error(
+          "PrimeCodex thread/fork cannot combine beforeTurnId and lastTurnId",
+        );
+      }
+
+      let forkEntryId: string | undefined;
+      if (beforeTurnId) {
+        forkEntryId = this.primeUserEntryForTurn(source, beforeTurnId);
+      } else if (lastTurnId) {
+        forkEntryId = this.nextPrimeUserEntryAfterTurn(source, lastTurnId);
+      }
+
+      if (forkEntryId) {
+        await client.request({ type: "fork", entryId: forkEntryId });
+        state = asRecord(
+          (await client.request({ type: "get_state" })).data,
+        ) as PrimeState;
+        if (
+          intermediateSessionId &&
+          intermediateSessionId !== state.sessionId
+        ) {
+          const finalSessionId = state.sessionId;
+          if (!finalSessionId) {
+            throw new Error("Prime Agent boundary fork returned no session id");
+          }
+
+          // Prime RPC forks the already-created clone in place. Stop it briefly
+          // so we can remove that staging session and keep the final fork linked
+          // directly to the original source session.
+          await client.stop();
+          await this.catalog.reparent(finalSessionId, source.filePath);
+          await this.catalog.delete(intermediateSessionId);
+
+          client = new PrimeAgentRpcClient({
+            command: this.options.primeCommand,
+            cwd,
+            resume: finalSessionId,
+            ...(source.provider
+              ? { provider: primeProvider(source.provider) }
+              : {}),
+            ...(requestedModel ? { model: requestedModel } : {}),
+            ...(requestedThinking ? { thinking: requestedThinking } : {}),
+          });
+          await client.start();
+          state = asRecord(
+            (await client.request({ type: "get_state" })).data,
+          ) as PrimeState;
+        }
+      }
+
+      const developerInstructions = optionalString(
+        params.developerInstructions,
+      )?.trim();
+      if (developerInstructions && state.sessionId) {
+        const finalSessionId = state.sessionId;
+        await client.stop();
+        await this.catalog.appendContextMessage(
+          finalSessionId,
+          "primecodex.developer_instructions",
+          developerInstructions,
+        );
+        client = new PrimeAgentRpcClient({
+          command: this.options.primeCommand,
+          cwd,
+          resume: finalSessionId,
+          ...(source.provider
+            ? { provider: primeProvider(source.provider) }
+            : {}),
+          ...(requestedModel ? { model: requestedModel } : {}),
+          ...(requestedThinking ? { thinking: requestedThinking } : {}),
+        });
+        await client.start();
+        state = asRecord(
+          (await client.request({ type: "get_state" })).data,
+        ) as PrimeState;
+      }
+
+      const saved = sessionFromState(state, cwd);
+      const ephemeral = params.ephemeral === true;
+      if (ephemeral) {
+        this.ephemeralPrimeThreads.add(saved.sessionId);
+        await this.catalog
+          .setArchived(saved.sessionId, true)
+          .catch(() => undefined);
+      }
+
+      const refreshed = (await this.catalog.find(saved.sessionId)) ?? saved;
+      const thread: CodexThread = {
+        ...threadFromPrimeSession(refreshed, {
+          loaded: true,
+          includeTurns: params.excludeTurns !== true,
+        }),
+        cwd,
+        ephemeral,
+        forkedFromId: threadId,
+      };
+      const session: PrimeCompatSession = {
+        threadId: thread.id,
+        sessionId: saved.sessionId,
+        cwd,
+        client,
+        state,
+      };
+      this.bindPrimeSession(session);
+      this.livePrimeThreads.set(thread.id, session);
+      rpcResult(id, sessionStartResult(thread, state, this.uiModel(state)));
+      notify("thread/started", { thread });
+    } catch (error) {
+      await client.stop();
+      throw error;
+    }
+  }
+
+  private primeUserEntryForTurn(
+    source: PrimeSavedSession,
+    turnId: string,
+  ): string {
+    const prefix = "prime-turn:";
+    const entryId = turnId.startsWith(prefix)
+      ? turnId.slice(prefix.length)
+      : "";
+    if (
+      !entryId ||
+      !source.messages.some(
+        (message) => message.role === "user" && message.entryId === entryId,
+      )
+    ) {
+      throw new Error(`PrimeCodex cannot resolve fork turn ${turnId}`);
+    }
+    return entryId;
+  }
+
+  private nextPrimeUserEntryAfterTurn(
+    source: PrimeSavedSession,
+    turnId: string,
+  ): string | undefined {
+    const currentEntryId = this.primeUserEntryForTurn(source, turnId);
+    let seen = false;
+    for (const message of source.messages) {
+      if (message.role !== "user") continue;
+      if (seen) return message.entryId;
+      if (message.entryId === currentEntryId) seen = true;
+    }
+    return undefined;
+  }
+
+  private async handlePrimeThreadUnsubscribe(
+    id: JsonRpcId,
+    threadId: string,
+  ): Promise<void> {
+    const live = this.livePrimeThreads.get(threadId);
+    if (live) {
+      if (live.currentTurn) {
+        await live.client.request({ type: "abort" }).catch(() => undefined);
+      }
+      await live.client.stop();
+      this.livePrimeThreads.delete(threadId);
+    }
+    if (this.ephemeralPrimeThreads.delete(threadId)) {
+      const sessionId = parsePrimeThreadId(threadId);
+      if (sessionId) await this.catalog.delete(sessionId);
+    }
+    rpcResult(id, {});
+  }
+
   private async handlePrimeTurnStart(
     id: JsonRpcId,
     threadId: string,
@@ -800,14 +1144,9 @@ export class CodexPrimeBridge {
     }
 
     const input = Array.isArray(params.input) ? params.input : [];
-    const texts = input
-      .map((entry) => asRecord(entry))
-      .filter(
-        (entry) => entry.type === "text" && typeof entry.text === "string",
-      )
-      .map((entry) => String(entry.text));
-    const message = texts.join("\n").trim();
-    if (!message) throw new Error("PrimeCodex currently requires text input");
+    const preparedInput = await primeInput(input);
+    const message = preparedInput.message;
+    if (!message) throw new Error("PrimeCodex received an empty task input");
 
     const requestedModel = primeModelId(params.model);
     if (requestedModel && requestedModel !== modelFromState(session.state)) {
@@ -846,7 +1185,27 @@ export class CodexPrimeBridge {
     session.currentTurn = turn;
 
     try {
-      await session.client.request({ type: "prompt", message });
+      await session.client.request({
+        type: "prompt",
+        message,
+        ...(preparedInput.images.length > 0
+          ? { images: preparedInput.images }
+          : {}),
+      });
+
+      // Prime persists the admitted user message before returning from prompt.
+      // Canonicalize the live turn/item IDs to the same IDs reconstructed from
+      // saved history so message-level "Continue in new task" works before a
+      // page reload as well as after one.
+      const persisted = await this.catalog.find(session.sessionId);
+      const latestUser = persisted?.messages.findLast(
+        (entry) => entry.role === "user",
+      );
+      if (latestUser) {
+        turn.id = `prime-turn:${latestUser.entryId}`;
+        turn.userItem.id = `prime-item:${latestUser.entryId}`;
+      }
+
       const codexTurn = this.codexTurn(turn, "inProgress");
       rpcResult(id, { turn: codexTurn });
       this.emitThreadSettings(session);
