@@ -42,6 +42,16 @@ type PrimeState = {
   thinkingLevel?: string;
   sessionFile?: string;
   sessionId?: string;
+  sessionActions?: {
+    queuedCount?: number;
+    steering?: string[];
+    followUps?: string[];
+    active?: {
+      kind?: string;
+      phase?: string;
+      label?: string;
+    };
+  };
 };
 
 type PrimeCompatSession = {
@@ -88,6 +98,7 @@ type PrimeTurnContext = {
   lastRecap?: string;
   interrupted: boolean;
   failed: boolean;
+  pendingAgentEnd?: boolean;
   latestUsage?: Record<string, unknown>;
 };
 
@@ -319,6 +330,11 @@ function modelFromState(state: PrimeState): string {
 
 function reasoningFromState(state: PrimeState): string {
   return state.thinkingLevel ?? "xhigh";
+}
+
+function primeHasPendingContinuation(state: PrimeState): boolean {
+  const actions = state.sessionActions;
+  return Boolean((actions?.queuedCount ?? 0) > 0 || actions?.active);
 }
 
 function primeProvider(value: unknown): string {
@@ -780,6 +796,9 @@ export class CodexPrimeBridge {
       case "turn/start":
         await this.handlePrimeTurnStart(id, threadId, params);
         return;
+      case "turn/steer":
+        await this.handlePrimeTurnSteer(id, threadId, params);
+        return;
       case "turn/interrupt":
         await this.handlePrimeTurnInterrupt(id, threadId);
         return;
@@ -1236,6 +1255,47 @@ export class CodexPrimeBridge {
     }
   }
 
+  private async handlePrimeTurnSteer(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const session = await this.ensurePrimeSession(threadId);
+    const turn = session.currentTurn;
+    if (!turn) {
+      throw new Error(
+        `Cannot steer Prime thread ${threadId} without an active turn`,
+      );
+    }
+
+    const expectedTurnId = optionalString(params.expectedTurnId);
+    if (!expectedTurnId) {
+      throw new Error("turn/steer requires expectedTurnId");
+    }
+    if (expectedTurnId !== turn.id) {
+      // Match native Codex' retryable precondition wording. The renderer parses
+      // the currently-active turn id from this message and retries once.
+      throw new Error(
+        `expected active turn id \`${expectedTurnId}\` but found \`${turn.id}\``,
+      );
+    }
+
+    const input = Array.isArray(params.input) ? params.input : [];
+    const preparedInput = await primeInput(input);
+    if (!preparedInput.message) {
+      throw new Error("PrimeCodex received an empty steering input");
+    }
+
+    await session.client.request({
+      type: "steer",
+      message: preparedInput.message,
+      ...(preparedInput.images.length > 0
+        ? { images: preparedInput.images }
+        : {}),
+    });
+    rpcResult(id, { turnId: turn.id });
+  }
+
   private async handlePrimeTurnInterrupt(
     id: JsonRpcId,
     threadId: string,
@@ -1320,6 +1380,37 @@ export class CodexPrimeBridge {
     const turn = session.currentTurn;
     if (!turn) return;
     const threadId = session.threadId;
+
+    if (event.type === "session_action_update") {
+      const actions = asRecord(event.actions);
+      const active = asRecord(actions.active);
+      session.state.sessionActions = {
+        queuedCount: numberOrNull(actions.queuedCount) ?? 0,
+        steering: Array.isArray(actions.steering)
+          ? actions.steering.filter(
+              (value): value is string => typeof value === "string",
+            )
+          : [],
+        followUps: Array.isArray(actions.followUps)
+          ? actions.followUps.filter(
+              (value): value is string => typeof value === "string",
+            )
+          : [],
+        ...(Object.keys(active).length > 0
+          ? {
+              active: {
+                kind: optionalString(active.kind),
+                phase: optionalString(active.phase),
+                label: optionalString(active.label),
+              },
+            }
+          : {}),
+      };
+      if (turn.pendingAgentEnd && !primeHasPendingContinuation(session.state)) {
+        this.finishPrimeTurn(session);
+      }
+      return;
+    }
 
     if (event.type === "message_update") {
       const update = asRecord(event.assistantMessageEvent);
@@ -1685,7 +1776,10 @@ export class CodexPrimeBridge {
     }
 
     if (event.type === "agent_end") {
-      this.finishPrimeTurn(session);
+      turn.pendingAgentEnd = true;
+      if (!primeHasPendingContinuation(session.state)) {
+        this.finishPrimeTurn(session);
+      }
     }
   }
 
@@ -1801,6 +1895,11 @@ export class CodexPrimeBridge {
       });
     }
 
+    // Native Codex keeps follow-up Queue in the renderer and submits it as a
+    // fresh turn/start as soon as this completion notification arrives. Clear
+    // the Prime in-flight guard first so that queued turn cannot race with the
+    // tail of the previous turn.
+    session.currentTurn = undefined;
     notify("thread/status/changed", {
       threadId: session.threadId,
       status: { type: "idle" },
@@ -1814,7 +1913,6 @@ export class CodexPrimeBridge {
       threadId: session.threadId,
       turn: this.codexTurn(turn, status),
     });
-    session.currentTurn = undefined;
   }
 
   private codexTurn(
