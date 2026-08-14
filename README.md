@@ -16,10 +16,10 @@ npm run primecodex
 
 Then open <http://127.0.0.1:8214>.
 
-On the composer, the backend pill immediately before the reasoning control
-shows `Codex` or `Prime`. It is an app-level context switch: Codex mode shows
-Codex sessions and creates Codex tasks, while Prime mode shows Prime Agent
-sessions and creates Prime tasks. Switching is client-side and does not reload
+At the bottom of the sidebar, a native-style `Codex | Prime` segmented switch
+controls the whole app context. Codex mode shows Codex sessions, Codex models,
+and creates Codex tasks; Prime mode shows Prime Agent sessions, Prime-prefixed
+models, and creates Prime tasks. Switching is client-side and does not reload
 the page. Prime mode expands the sidebar history so all available non-archived
 Prime sessions are surfaced.
 

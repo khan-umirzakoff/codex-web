@@ -153,10 +153,6 @@ function primeModelId(value: unknown): string | undefined {
     : model;
 }
 
-function isPrimeModelId(value: unknown): boolean {
-  return optionalString(value)?.startsWith(PRIME_MODEL_PREFIX) === true;
-}
-
 function sessionFromState(
   state: PrimeState,
   cwd: string,
@@ -332,6 +328,24 @@ export class CodexPrimeBridge {
         return;
       }
 
+      // The renderer intentionally keeps native and Prime-prefixed model rows in
+      // one cache so switching workspace mode is instant. If a Prime-prefixed
+      // model happens to still be selected while Codex mode is active, normalize
+      // it before forwarding the new thread to native Codex.
+      if (request.method === "thread/start") {
+        const model = optionalString(request.params?.model);
+        if (model?.startsWith(PRIME_MODEL_PREFIX)) {
+          this.codex.send({
+            ...request,
+            params: {
+              ...(request.params ?? {}),
+              model: model.slice(PRIME_MODEL_PREFIX.length),
+            },
+          });
+          return;
+        }
+      }
+
       this.codex.send(value);
     } catch (error) {
       if (request.id !== undefined) {
@@ -354,13 +368,13 @@ export class CodexPrimeBridge {
   private async shouldCreatePrimeThread(
     params: Record<string, unknown>,
   ): Promise<boolean> {
-    if (isPrimeModelId(params.model) || this.options.mode === "prime") {
-      return true;
-    }
+    if (this.options.mode === "prime") return true;
     if (this.options.mode !== "hybrid") return false;
 
     const controlFile = this.options.controlFile;
-    if (!controlFile) return this.options.newThreadBackend === "prime";
+    if (!controlFile) {
+      return this.options.newThreadBackend === "prime";
+    }
     const control = await readPrimeCodexControlState(controlFile, {
       activeBackend: this.options.newThreadBackend,
       newThreadBackend: this.options.newThreadBackend,
@@ -422,6 +436,9 @@ export class CodexPrimeBridge {
         ...message,
         result: {
           ...result,
+          // Keep both model families in the renderer cache. The injected UI
+          // filters the visible picker by workspace mode, so Codex ↔ Prime does
+          // not require a page reload or query-cache reset.
           data: [...nativeModels, ...primeModels],
         },
       });
