@@ -40,8 +40,24 @@ type PrimeState = {
     contextWindow?: number;
   };
   thinkingLevel?: string;
+  isStreaming?: boolean;
+  isCompacting?: boolean;
   sessionFile?: string;
   sessionId?: string;
+  goal?: {
+    active?: boolean;
+    status?: string;
+    goalId?: string;
+    objective?: string;
+    tokenBudget?: number;
+    tokensUsed?: number;
+    timeUsedSeconds?: number;
+    continuationsUsed?: number;
+    createdAt?: number;
+    updatedAt?: number;
+    lastReason?: string;
+    lastError?: string;
+  };
   sessionActions?: {
     queuedCount?: number;
     steering?: string[];
@@ -116,6 +132,46 @@ function optionalString(value: unknown): string | undefined {
 
 function numberOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function codexGoalFromPrime(
+  threadId: string,
+  value: unknown,
+): Record<string, unknown> | null {
+  const goal = asRecord(value);
+  const objective = optionalString(goal.objective);
+  const primeStatus = optionalString(goal.status);
+  if (!objective || !primeStatus || primeStatus === "idle") return null;
+
+  const status =
+    primeStatus === "active"
+      ? "active"
+      : primeStatus === "paused"
+        ? "paused"
+        : primeStatus === "budget_limited"
+          ? "budgetLimited"
+          : primeStatus === "complete"
+            ? "complete"
+            : "blocked";
+  const nowSeconds = Math.floor(Date.now() / 1_000);
+  const createdAt = numberOrNull(goal.createdAt);
+  const updatedAt = numberOrNull(goal.updatedAt);
+  return {
+    threadId,
+    objective,
+    status,
+    tokenBudget: numberOrNull(goal.tokenBudget),
+    tokensUsed: numberOrNull(goal.tokensUsed) ?? 0,
+    timeUsedSeconds: numberOrNull(goal.timeUsedSeconds) ?? 0,
+    createdAt:
+      createdAt == null
+        ? nowSeconds
+        : Math.floor(createdAt > 1e11 ? createdAt / 1_000 : createdAt),
+    updatedAt:
+      updatedAt == null
+        ? nowSeconds
+        : Math.floor(updatedAt > 1e11 ? updatedAt / 1_000 : updatedAt),
+  };
 }
 
 function contentText(content: unknown): string {
@@ -793,6 +849,27 @@ export class CodexPrimeBridge {
       case "thread/unsubscribe":
         await this.handlePrimeThreadUnsubscribe(id, threadId);
         return;
+      case "thread/delete":
+        await this.handlePrimeThreadDelete(id, threadId);
+        return;
+      case "thread/compact/start":
+        await this.handlePrimeThreadCompact(id, threadId);
+        return;
+      case "thread/rollback":
+        await this.handlePrimeThreadRollback(id, threadId, params);
+        return;
+      case "thread/settings/update":
+        await this.handlePrimeThreadSettingsUpdate(id, threadId, params);
+        return;
+      case "thread/goal/get":
+        await this.handlePrimeThreadGoalGet(id, threadId);
+        return;
+      case "thread/goal/set":
+        await this.handlePrimeThreadGoalSet(id, threadId, params);
+        return;
+      case "thread/goal/clear":
+        await this.handlePrimeThreadGoalClear(id, threadId);
+        return;
       case "turn/start":
         await this.handlePrimeTurnStart(id, threadId, params);
         return;
@@ -1151,6 +1228,389 @@ export class CodexPrimeBridge {
     rpcResult(id, {});
   }
 
+  private async handlePrimeThreadDelete(
+    id: JsonRpcId,
+    threadId: string,
+  ): Promise<void> {
+    const saved = await this.requireSavedPrimeThread(threadId);
+    const live = this.livePrimeThreads.get(threadId);
+    if (live?.currentTurn) {
+      await live.client.request({ type: "abort" }).catch(() => undefined);
+    }
+
+    if (live) {
+      const killed = await live.client.killResidentSession();
+      if (!killed) await live.client.stop();
+      this.livePrimeThreads.delete(threadId);
+    } else {
+      await PrimeAgentRpcClient.killResident({
+        command: this.options.primeCommand,
+        cwd: saved.cwd,
+        resume: saved.sessionId,
+      }).catch(() => false);
+    }
+
+    this.ephemeralPrimeThreads.delete(threadId);
+    await this.catalog.delete(saved.sessionId);
+    rpcResult(id, {});
+    notify("thread/deleted", { threadId });
+  }
+
+  private async handlePrimeThreadCompact(
+    id: JsonRpcId,
+    threadId: string,
+  ): Promise<void> {
+    const session = await this.ensurePrimeSession(threadId);
+    if (session.currentTurn) {
+      throw new Error(
+        "Cannot compact a Prime thread while a turn is in progress",
+      );
+    }
+
+    const turn = this.beginPrimeSyntheticTurn(session);
+    try {
+      await session.client.request({ type: "compact" }, 180_000);
+      await this.refreshPrimeState(session);
+
+      const codexTurn = this.codexTurn(turn, "inProgress");
+      notify("thread/status/changed", {
+        threadId,
+        status: { type: "active", activeFlags: [] },
+      });
+      notify("turn/started", { threadId, turn: codexTurn });
+      turn.ready = true;
+      for (const event of turn.bufferedEvents.splice(0)) {
+        this.translatePrimeEvent(session, event);
+      }
+      if (session.currentTurn === turn) this.finishPrimeTurn(session);
+
+      rpcResult(id, {});
+      notify("thread/compacted", { threadId, turnId: turn.id });
+    } catch (error) {
+      if (session.currentTurn === turn) session.currentTurn = undefined;
+      throw error;
+    }
+  }
+
+  private async handlePrimeThreadRollback(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const numTurns = numberOrNull(params.numTurns);
+    if (numTurns === null || !Number.isInteger(numTurns) || numTurns <= 0) {
+      throw new Error("thread/rollback requires a positive integer numTurns");
+    }
+
+    const saved = await this.requireSavedPrimeThread(threadId);
+    const availableTurns = saved.messages.filter(
+      (message) => message.role === "user" || message.role === "goal",
+    ).length;
+    if (numTurns > availableTurns) {
+      throw new Error(
+        `Cannot rollback ${numTurns} turns from a session with ${availableTurns} turns`,
+      );
+    }
+    const live = this.livePrimeThreads.get(threadId);
+    if (live?.currentTurn) {
+      throw new Error(
+        "Cannot rollback a Prime thread while a turn is in progress",
+      );
+    }
+
+    if (live) {
+      const killed = await live.client.killResidentSession();
+      if (!killed) await live.client.stop();
+      this.livePrimeThreads.delete(threadId);
+    } else {
+      await PrimeAgentRpcClient.killResident({
+        command: this.options.primeCommand,
+        cwd: saved.cwd,
+        resume: saved.sessionId,
+      }).catch(() => false);
+    }
+
+    const refreshed = await this.catalog.rollbackTurns(
+      saved.sessionId,
+      numTurns,
+    );
+    rpcResult(id, {
+      thread: threadFromPrimeSession(refreshed, {
+        loaded: false,
+        includeTurns: true,
+      }),
+    });
+  }
+
+  private async handlePrimeThreadSettingsUpdate(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const session = await this.ensurePrimeSession(threadId);
+    if (session.currentTurn) {
+      throw new Error(
+        "Cannot change Prime thread settings while a turn is in progress",
+      );
+    }
+
+    const requestedModelRaw = optionalString(params.model);
+    const requestedModel = requestedModelRaw?.startsWith(PRIME_MODEL_PREFIX)
+      ? requestedModelRaw.slice(PRIME_MODEL_PREFIX.length)
+      : requestedModelRaw;
+    if (requestedModel && requestedModel !== modelFromState(session.state)) {
+      await session.client.request({
+        type: "set_model",
+        provider: primeProvider(session.state.model?.provider),
+        modelId: requestedModel,
+      });
+    }
+
+    const thinking = toPrimeThinking(params.effort);
+    if (thinking && thinking !== session.state.thinkingLevel) {
+      await session.client.request({
+        type: "set_thinking_level",
+        level: thinking,
+      });
+    }
+
+    session.state = asRecord(
+      (await session.client.request({ type: "get_state" })).data,
+    ) as PrimeState;
+    // Prime does not implement Codex approval/sandbox/personality settings.
+    // Emit the real Prime-effective settings before resolving the request so the
+    // renderer does not optimistically retain unsupported values.
+    this.emitThreadSettings(session);
+    rpcResult(id, {});
+  }
+
+  private async refreshPrimeState(
+    session: PrimeCompatSession,
+  ): Promise<PrimeState> {
+    session.state = asRecord(
+      (await session.client.request({ type: "get_state" })).data,
+    ) as PrimeState;
+    return session.state;
+  }
+
+  private beginPrimeSyntheticTurn(
+    session: PrimeCompatSession,
+  ): PrimeTurnContext {
+    const turn: PrimeTurnContext = {
+      id: `prime-synthetic-turn:${randomUUID()}`,
+      userItem: {
+        type: "userMessage",
+        id: `prime-synthetic-input:${randomUUID()}`,
+        clientId: null,
+        content: [],
+      },
+      items: [],
+      startedAtMs: Date.now(),
+      ready: false,
+      bufferedEvents: [],
+      tools: new Map(),
+      subagentIds: new Set(),
+      interrupted: false,
+      failed: false,
+    };
+    session.currentTurn = turn;
+    return turn;
+  }
+
+  private async runPrimeGoalCommand(
+    session: PrimeCompatSession,
+    command: string,
+    options: { expectAgentTurn?: boolean } = {},
+  ): Promise<PrimeState> {
+    const turn =
+      options.expectAgentTurn === true && !session.currentTurn
+        ? this.beginPrimeSyntheticTurn(session)
+        : undefined;
+    try {
+      await session.client.request({ type: "prompt", message: command });
+      const state = await this.refreshPrimeState(session);
+      if (!turn) return state;
+
+      const ranAgent =
+        state.isStreaming === true ||
+        turn.bufferedEvents.some((event) =>
+          [
+            "agent_start",
+            "agent_end",
+            "message_update",
+            "tool_execution_start",
+            "bash_start",
+            "rlm_child_update",
+          ].includes(event.type),
+        );
+      if (!ranAgent) {
+        if (session.currentTurn === turn) session.currentTurn = undefined;
+        return state;
+      }
+
+      const persisted = await this.catalog.find(session.sessionId);
+      const goalBoundary = persisted?.messages.findLast(
+        (entry) => entry.role === "goal",
+      );
+      if (goalBoundary) turn.id = `prime-turn:${goalBoundary.entryId}`;
+
+      const codexTurn = this.codexTurn(turn, "inProgress");
+      this.emitThreadSettings(session);
+      notify("thread/status/changed", {
+        threadId: session.threadId,
+        status: { type: "active", activeFlags: [] },
+      });
+      notify("turn/started", { threadId: session.threadId, turn: codexTurn });
+      turn.ready = true;
+      for (const event of turn.bufferedEvents.splice(0)) {
+        this.translatePrimeEvent(session, event);
+      }
+      return state;
+    } catch (error) {
+      if (turn && session.currentTurn === turn) session.currentTurn = undefined;
+      throw error;
+    }
+  }
+
+  private async handlePrimeThreadGoalGet(
+    id: JsonRpcId,
+    threadId: string,
+  ): Promise<void> {
+    const session = await this.ensurePrimeSession(threadId);
+    const state = await this.refreshPrimeState(session);
+    rpcResult(id, { goal: codexGoalFromPrime(threadId, state.goal) });
+  }
+
+  private async handlePrimeThreadGoalSet(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const session = await this.ensurePrimeSession(threadId);
+    let state = await this.refreshPrimeState(session);
+    const currentGoal = asRecord(state.goal);
+    const requestedObjective =
+      typeof params.objective === "string"
+        ? params.objective.trim()
+        : undefined;
+    const requestedStatus = optionalString(params.status);
+    const hasTokenBudget = Object.prototype.hasOwnProperty.call(
+      params,
+      "tokenBudget",
+    );
+    const requestedBudget = hasTokenBudget
+      ? numberOrNull(params.tokenBudget)
+      : numberOrNull(currentGoal.tokenBudget);
+    const currentObjective = optionalString(currentGoal.objective);
+    const targetObjective = requestedObjective ?? currentObjective;
+
+    if (requestedObjective !== undefined || hasTokenBudget) {
+      if (!targetObjective) {
+        throw new Error("thread/goal/set requires a goal objective");
+      }
+      if (
+        hasTokenBudget &&
+        params.tokenBudget !== null &&
+        requestedBudget === null
+      ) {
+        throw new Error(
+          "thread/goal/set tokenBudget must be a positive integer or null",
+        );
+      }
+      if (
+        requestedBudget !== null &&
+        (!Number.isInteger(requestedBudget) || requestedBudget <= 0)
+      ) {
+        throw new Error(
+          "thread/goal/set tokenBudget must be a positive integer or null",
+        );
+      }
+      const budgetArg =
+        requestedBudget === null ? "" : `--budget ${requestedBudget} `;
+      state = await this.runPrimeGoalCommand(
+        session,
+        `/goal ${budgetArg}${targetObjective}`,
+        {
+          expectAgentTurn: !session.currentTurn && requestedStatus !== "paused",
+        },
+      );
+    }
+
+    const goal = asRecord(state.goal);
+    const primeStatus = optionalString(goal.status);
+    if (requestedStatus === "active") {
+      if (!optionalString(goal.objective)) {
+        throw new Error(
+          "Cannot activate a Prime thread without a goal objective",
+        );
+      }
+      if (primeStatus === "paused" || primeStatus === "budget_limited") {
+        state = await this.runPrimeGoalCommand(session, "/goal resume", {
+          expectAgentTurn: !session.currentTurn,
+        });
+      } else if (
+        primeStatus === "active" &&
+        state.isStreaming !== true &&
+        !session.currentTurn &&
+        requestedObjective === undefined &&
+        !hasTokenBudget
+      ) {
+        // Prime keeps an active goal persisted across restarts, but an idle
+        // resumed session needs an explicit resume edge to restart autonomous
+        // continuation. Pause+resume preserves the objective and accounting.
+        await this.runPrimeGoalCommand(session, "/goal pause");
+        state = await this.runPrimeGoalCommand(session, "/goal resume", {
+          expectAgentTurn: true,
+        });
+      }
+    } else if (requestedStatus === "paused" && primeStatus === "active") {
+      if (session.currentTurn || state.isStreaming === true) {
+        if (session.currentTurn) session.currentTurn.interrupted = true;
+        await session.client.request({ type: "abort" });
+      }
+      state = await this.runPrimeGoalCommand(session, "/goal pause");
+    } else if (
+      requestedStatus &&
+      requestedStatus !== "active" &&
+      requestedStatus !== "paused"
+    ) {
+      throw new Error(
+        `PrimeCodex cannot directly set Prime goal status ${requestedStatus}`,
+      );
+    }
+
+    const mapped = codexGoalFromPrime(threadId, state.goal);
+    if (!mapped)
+      throw new Error("Prime Agent did not return an active thread goal");
+    rpcResult(id, { goal: mapped });
+    notify("thread/goal/updated", {
+      threadId,
+      turnId: session.currentTurn?.id ?? null,
+      goal: mapped,
+    });
+  }
+
+  private async handlePrimeThreadGoalClear(
+    id: JsonRpcId,
+    threadId: string,
+  ): Promise<void> {
+    const session = await this.ensurePrimeSession(threadId);
+    const state = await this.refreshPrimeState(session);
+    const hadGoal = codexGoalFromPrime(threadId, state.goal) !== null;
+    if (!hadGoal) {
+      rpcResult(id, { cleared: false });
+      return;
+    }
+
+    if (session.currentTurn || state.isStreaming === true) {
+      if (session.currentTurn) session.currentTurn.interrupted = true;
+      await session.client.request({ type: "abort" });
+    }
+    await this.runPrimeGoalCommand(session, "/goal clear");
+    rpcResult(id, { cleared: true });
+    notify("thread/goal/cleared", { threadId });
+  }
+
   private async handlePrimeTurnStart(
     id: JsonRpcId,
     threadId: string,
@@ -1362,6 +1822,15 @@ export class CodexPrimeBridge {
 
   private bindPrimeSession(session: PrimeCompatSession): void {
     session.client.onEvent((event) => {
+      if (event.type === "goal_update") {
+        const turn = session.currentTurn;
+        if (turn && !turn.ready) {
+          turn.bufferedEvents.push(event);
+          return;
+        }
+        this.handlePrimeGoalUpdate(session, event);
+        return;
+      }
       const turn = session.currentTurn;
       if (!turn) return;
       if (!turn.ready) {
@@ -1372,6 +1841,24 @@ export class CodexPrimeBridge {
     });
   }
 
+  private handlePrimeGoalUpdate(
+    session: PrimeCompatSession,
+    event: PrimeRpcEvent,
+  ): void {
+    const goal = asRecord(event.goal);
+    session.state.goal = goal as PrimeState["goal"];
+    const mapped = codexGoalFromPrime(session.threadId, goal);
+    if (!mapped) {
+      notify("thread/goal/cleared", { threadId: session.threadId });
+      return;
+    }
+    notify("thread/goal/updated", {
+      threadId: session.threadId,
+      turnId: session.currentTurn?.id ?? null,
+      goal: mapped,
+    });
+  }
+
   private translatePrimeEvent(
     session: PrimeCompatSession,
     event: PrimeRpcEvent,
@@ -1379,6 +1866,11 @@ export class CodexPrimeBridge {
     const turn = session.currentTurn;
     if (!turn) return;
     const threadId = session.threadId;
+
+    if (event.type === "goal_update") {
+      this.handlePrimeGoalUpdate(session, event);
+      return;
+    }
 
     if (event.type === "session_action_update") {
       const actions = asRecord(event.actions);

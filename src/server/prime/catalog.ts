@@ -6,7 +6,7 @@ import path from "node:path";
 export type PrimePersistedMessage = {
   entryId: string;
   timestampMs: number;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "goal";
   content: Array<Record<string, unknown>>;
 };
 
@@ -36,6 +36,8 @@ type PrimeEntry = {
   modelId?: string;
   provider?: string;
   thinkingLevel?: string;
+  customType?: string;
+  content?: string | Array<Record<string, unknown>>;
   state?: { status?: string } | string;
   message?: {
     role?: string;
@@ -134,6 +136,25 @@ function parseSessionFile(
 
   const messages: PrimePersistedMessage[] = [];
   for (const entry of activeBranch(entries)) {
+    if (
+      entry.type === "custom_message" &&
+      entry.customType === "goal_context" &&
+      entry.id
+    ) {
+      const content =
+        typeof entry.content === "string"
+          ? [{ type: "text", text: entry.content }]
+          : Array.isArray(entry.content)
+            ? entry.content
+            : [];
+      messages.push({
+        entryId: entry.id,
+        timestampMs: parseTimestamp(entry.timestamp, updatedAtMs),
+        role: "goal",
+        content,
+      });
+      continue;
+    }
     if (entry.type !== "message" || !entry.id || !entry.message) continue;
     if (entry.message.role !== "user" && entry.message.role !== "assistant") {
       continue;
@@ -254,6 +275,73 @@ export class PrimeSessionCatalog {
         force: true,
       },
     );
+  }
+
+  async rollbackTurns(
+    sessionId: string,
+    numTurns: number,
+  ): Promise<PrimeSavedSession> {
+    if (!Number.isInteger(numTurns) || numTurns <= 0) {
+      throw new Error("numTurns must be a positive integer");
+    }
+    const saved = await this.find(sessionId);
+    if (!saved) throw new Error(`Prime Agent session not found: ${sessionId}`);
+
+    const turnBoundaries = saved.messages.filter(
+      (message) => message.role === "user" || message.role === "goal",
+    );
+    if (numTurns > turnBoundaries.length) {
+      throw new Error(
+        `Cannot rollback ${numTurns} turns from a session with ${turnBoundaries.length} turns`,
+      );
+    }
+    const firstRolledBackTurn =
+      turnBoundaries[turnBoundaries.length - numTurns];
+    if (!firstRolledBackTurn) {
+      throw new Error("Cannot resolve the first Prime turn to roll back");
+    }
+    const source = await fs.readFile(saved.filePath, "utf8");
+    let targetParentId: string | null | undefined;
+    const ids = new Set<string>();
+    for (const line of source.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line) as PrimeEntry;
+        if (entry.id) ids.add(entry.id);
+        if (entry.id === firstRolledBackTurn.entryId) {
+          targetParentId = entry.parentId ?? null;
+        }
+      } catch {
+        // Match Prime Agent's tolerant JSONL loader.
+      }
+    }
+    if (targetParentId === undefined) {
+      throw new Error(
+        `Cannot resolve Prime rollback entry ${firstRolledBackTurn.entryId}`,
+      );
+    }
+
+    let id = randomBytes(8).toString("hex");
+    while (ids.has(id)) id = randomBytes(8).toString("hex");
+    const marker = {
+      type: "custom",
+      id,
+      parentId: targetParentId,
+      timestamp: new Date().toISOString(),
+      customType: "primecodex.rollback",
+      data: {
+        numTurns,
+        firstRolledBackEntryId: firstRolledBackTurn.entryId,
+      },
+    };
+    await fs.appendFile(saved.filePath, `${JSON.stringify(marker)}\n`, "utf8");
+
+    const refreshed = await parseSessionFile(
+      saved.filePath,
+      await fs.readFile(saved.filePath, "utf8"),
+    );
+    if (!refreshed) throw new Error("Prime rollback marker was not persisted");
+    return refreshed;
   }
 
   async reparent(sessionId: string, parentSession: string): Promise<void> {

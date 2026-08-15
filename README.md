@@ -36,7 +36,9 @@ session persistence, reasoning effort, streaming events, command/tool events,
 and daemon attachment when an already-running session is reopened. Native
 Codex task lifecycle actions are mapped for Prime threads too: continue/fork
 (including historical-turn and worktree forks), archive/unarchive, ephemeral
-side tasks, and rich composer context such as attached files and local images.
+side tasks, rollback/edit, delete, manual context compaction, persistent thread
+goals, model/reasoning settings, and rich composer context such as attached files
+and local images.
 Side-task developer instructions are persisted as hidden Prime context, and
 closing a side task removes its ephemeral Prime backing session.
 

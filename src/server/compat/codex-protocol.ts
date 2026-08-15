@@ -114,23 +114,26 @@ export function turnsFromPrimeMessages(
   let current: CodexTurn | undefined;
 
   for (const message of messages) {
-    if (message.role === "user") {
+    if (message.role === "user" || message.role === "goal") {
       current = {
         id: `prime-turn:${message.entryId}`,
-        items: [
-          {
-            type: "userMessage",
-            id: `prime-item:${message.entryId}`,
-            clientId: null,
-            content: [
-              {
-                type: "text",
-                text: textFromContent(message.content),
-                text_elements: [],
-              },
-            ],
-          },
-        ],
+        items:
+          message.role === "user"
+            ? [
+                {
+                  type: "userMessage",
+                  id: `prime-item:${message.entryId}`,
+                  clientId: null,
+                  content: [
+                    {
+                      type: "text",
+                      text: textFromContent(message.content),
+                      text_elements: [],
+                    },
+                  ],
+                },
+              ]
+            : [],
         itemsView: "full",
         status: "completed",
         error: null,

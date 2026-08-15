@@ -233,6 +233,7 @@ export class PrimeAgentDaemonRpcClient {
         );
         break;
       case "abort":
+      case "compact":
       case "set_thinking_level":
       case "set_session_name":
       case "steer":
