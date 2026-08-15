@@ -590,6 +590,13 @@ export const ipcRenderer = {
       return themeMediaQuery.matches ? "dark" : "light";
     }
 
+    if (channel === "codex_desktop:start-file-drag") {
+      // Native Electron can initiate an OS drag from a local path. A browser
+      // cannot do that synchronously; false is the native \"not started\"
+      // result and lets the renderer fall back without throwing.
+      return false;
+    }
+
     return unimplemented("ipcRenderer.sendSync");
   },
 };

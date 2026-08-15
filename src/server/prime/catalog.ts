@@ -21,6 +21,11 @@ export type PrimeSavedSession = {
   model?: string;
   provider?: string;
   thinking?: string;
+  gitInfo?: {
+    sha: string | null;
+    branch: string | null;
+    originUrl: string | null;
+  };
   archived: boolean;
   messages: PrimePersistedMessage[];
 };
@@ -36,6 +41,11 @@ type PrimeEntry = {
   modelId?: string;
   provider?: string;
   thinkingLevel?: string;
+  git?: {
+    repoUrl?: string;
+    commit?: string;
+    branch?: string;
+  };
   customType?: string;
   content?: string | Array<Record<string, unknown>>;
   state?: { status?: string } | string;
@@ -134,8 +144,14 @@ function parseSessionFile(
     }
   }
 
+  let gitContext = header.git;
+  const branch = activeBranch(entries);
+  for (const entry of branch) {
+    if (entry.type === "git_state" && entry.git) gitContext = entry.git;
+  }
+
   const messages: PrimePersistedMessage[] = [];
-  for (const entry of activeBranch(entries)) {
+  for (const entry of branch) {
     if (
       entry.type === "custom_message" &&
       entry.customType === "goal_context" &&
@@ -182,6 +198,15 @@ function parseSessionFile(
     ...(model ? { model } : {}),
     ...(provider ? { provider } : {}),
     ...(thinking ? { thinking } : {}),
+    ...(gitContext
+      ? {
+          gitInfo: {
+            sha: gitContext.commit ?? null,
+            branch: gitContext.branch ?? null,
+            originUrl: gitContext.repoUrl ?? null,
+          },
+        }
+      : {}),
     archived,
     messages,
   };
@@ -341,6 +366,76 @@ export class PrimeSessionCatalog {
       await fs.readFile(saved.filePath, "utf8"),
     );
     if (!refreshed) throw new Error("Prime rollback marker was not persisted");
+    return refreshed;
+  }
+
+  async updateGitInfo(
+    sessionId: string,
+    patch: {
+      sha?: string | null;
+      branch?: string | null;
+      originUrl?: string | null;
+    } | null,
+  ): Promise<PrimeSavedSession> {
+    const saved = await this.find(sessionId);
+    if (!saved) throw new Error(`Prime Agent session not found: ${sessionId}`);
+
+    const current = saved.gitInfo ?? {
+      sha: null,
+      branch: null,
+      originUrl: null,
+    };
+    const next =
+      patch == null
+        ? { sha: null, branch: null, originUrl: null }
+        : {
+            sha: Object.prototype.hasOwnProperty.call(patch, "sha")
+              ? (patch.sha ?? null)
+              : current.sha,
+            branch: Object.prototype.hasOwnProperty.call(patch, "branch")
+              ? (patch.branch ?? null)
+              : current.branch,
+            originUrl: Object.prototype.hasOwnProperty.call(patch, "originUrl")
+              ? (patch.originUrl ?? null)
+              : current.originUrl,
+          };
+
+    const source = await fs.readFile(saved.filePath, "utf8");
+    const ids = new Set<string>();
+    let leafId: string | null = null;
+    for (const line of source.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line) as PrimeEntry;
+        if (entry.type !== "session" && entry.id) {
+          ids.add(entry.id);
+          leafId = entry.id;
+        }
+      } catch {
+        // Match Prime Agent's tolerant JSONL loader.
+      }
+    }
+
+    let id = randomBytes(4).toString("hex");
+    while (ids.has(id)) id = randomBytes(4).toString("hex");
+    const entry = {
+      type: "git_state",
+      id,
+      parentId: leafId,
+      timestamp: new Date().toISOString(),
+      git: {
+        ...(next.originUrl ? { repoUrl: next.originUrl } : {}),
+        ...(next.sha ? { commit: next.sha } : {}),
+        ...(next.branch ? { branch: next.branch } : {}),
+      },
+    };
+    await fs.appendFile(saved.filePath, `${JSON.stringify(entry)}\n`, "utf8");
+
+    const refreshed = parseSessionFile(
+      saved.filePath,
+      await fs.readFile(saved.filePath, "utf8"),
+    );
+    if (!refreshed) throw new Error("Prime git metadata was not persisted");
     return refreshed;
   }
 

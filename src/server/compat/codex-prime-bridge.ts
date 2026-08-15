@@ -185,6 +185,21 @@ function contentText(content: unknown): string {
     .join("");
 }
 
+function injectedUserItemText(value: unknown): string | undefined {
+  const item = asRecord(value);
+  if (item.type !== "message" || item.role !== "user") return undefined;
+  if (!Array.isArray(item.content)) return undefined;
+  const parts = item.content
+    .map((raw) => asRecord(raw))
+    .filter(
+      (block) =>
+        (block.type === "input_text" || block.type === "text") &&
+        typeof block.text === "string",
+    )
+    .map((block) => String(block.text));
+  return parts.length > 0 ? parts.join("\n") : undefined;
+}
+
 function imageMimeType(filePath: string): string | undefined {
   switch (extname(filePath).toLowerCase()) {
     case ".png":
@@ -796,7 +811,9 @@ export class CodexPrimeBridge {
       const state = asRecord(
         (await client.request({ type: "get_state" })).data,
       ) as PrimeState;
-      const saved = sessionFromState(state, cwd);
+      const stateSession = sessionFromState(state, cwd);
+      const saved =
+        (await this.catalog.find(stateSession.sessionId)) ?? stateSession;
       const thread = threadFromPrimeSession(saved, { loaded: true });
       const session: PrimeCompatSession = {
         threadId: thread.id,
@@ -860,6 +877,18 @@ export class CodexPrimeBridge {
         return;
       case "thread/settings/update":
         await this.handlePrimeThreadSettingsUpdate(id, threadId, params);
+        return;
+      case "thread/metadata/update":
+        await this.handlePrimeThreadMetadataUpdate(id, threadId, params);
+        return;
+      case "thread/inject_items":
+        await this.handlePrimeThreadInjectItems(id, threadId, params);
+        return;
+      case "thread/backgroundTerminals/clean":
+        // Prime command/tool processes are owned by Prime itself and are
+        // interrupted via turn/interrupt. There is no separate Codex terminal
+        // registry to clean for a Prime-backed thread.
+        rpcResult(id, {});
         return;
       case "thread/goal/get":
         await this.handlePrimeThreadGoalGet(id, threadId);
@@ -1143,7 +1172,7 @@ export class CodexPrimeBridge {
       const saved = sessionFromState(state, cwd);
       const ephemeral = params.ephemeral === true;
       if (ephemeral) {
-        this.ephemeralPrimeThreads.add(saved.sessionId);
+        this.ephemeralPrimeThreads.add(primeThreadId(saved.sessionId));
         await this.catalog
           .setArchived(saved.sessionId, true)
           .catch(() => undefined);
@@ -1381,6 +1410,132 @@ export class CodexPrimeBridge {
     // Emit the real Prime-effective settings before resolving the request so the
     // renderer does not optimistically retain unsupported values.
     this.emitThreadSettings(session);
+    rpcResult(id, {});
+  }
+
+  private async handlePrimeThreadMetadataUpdate(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const saved = await this.requireSavedPrimeThread(threadId);
+    let refreshed = saved;
+    if (Object.prototype.hasOwnProperty.call(params, "gitInfo")) {
+      const raw = params.gitInfo;
+      let patch: {
+        sha?: string | null;
+        branch?: string | null;
+        originUrl?: string | null;
+      } | null;
+      if (raw === null) {
+        patch = null;
+      } else {
+        const gitInfo = asRecord(raw);
+        patch = {};
+        for (const key of ["sha", "branch", "originUrl"] as const) {
+          if (!Object.prototype.hasOwnProperty.call(gitInfo, key)) continue;
+          const value = gitInfo[key];
+          if (
+            value !== null &&
+            (typeof value !== "string" || value.length === 0)
+          ) {
+            throw new Error(
+              `thread/metadata/update gitInfo.${key} must be a non-empty string or null`,
+            );
+          }
+          patch[key] = value as string | null;
+        }
+      }
+      refreshed = await this.catalog.updateGitInfo(saved.sessionId, patch);
+    }
+
+    rpcResult(id, {
+      thread: threadFromPrimeSession(refreshed, {
+        loaded: this.livePrimeThreads.has(threadId),
+      }),
+    });
+  }
+
+  private async unloadPrimeSessionForExternalMutation(
+    threadId: string,
+  ): Promise<void> {
+    const live = this.livePrimeThreads.get(threadId);
+    if (!live) return;
+    if (live.currentTurn) {
+      throw new Error(
+        "Cannot mutate Prime thread history while a turn is in progress",
+      );
+    }
+
+    const saved = await this.requireSavedPrimeThread(threadId);
+    const killedResident = await live.client
+      .killResidentSession()
+      .catch(() => false);
+    if (!killedResident) await live.client.stop();
+    this.livePrimeThreads.delete(threadId);
+
+    // Prime's daemon kill path archives the persisted session. inject_items is
+    // a history mutation, not an archive action, so restore the prior lifecycle.
+    if (killedResident && !saved.archived) {
+      await this.catalog.setArchived(saved.sessionId, false);
+    }
+  }
+
+  private async handlePrimeThreadInjectItems(
+    id: JsonRpcId,
+    threadId: string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    if (!Array.isArray(params.items)) {
+      throw new Error("thread/inject_items requires an items array");
+    }
+    if (params.items.length === 0) {
+      rpcResult(id, {});
+      return;
+    }
+
+    const injected = params.items.map(injectedUserItemText);
+    if (injected.some((text) => text === undefined)) {
+      throw new Error(
+        "PrimeCodex currently supports thread/inject_items user message text items only",
+      );
+    }
+    const texts = injected as string[];
+    const saved = await this.requireSavedPrimeThread(threadId);
+    const live = this.livePrimeThreads.get(threadId);
+
+    // Resident daemon sessions can accept a hidden custom message directly,
+    // preserving their in-memory context without a restart. Prime's standalone
+    // RPC mode does not expose this daemon command, so do not probe it and pay
+    // the request timeout there.
+    if (live?.client.isDaemonBacked()) {
+      for (const text of texts) {
+        await live.client.request({
+          type: "append_custom_message",
+          message: {
+            customType: "primecodex.injected_item",
+            content: text,
+            display: false,
+            details: { source: "primecodex", kind: "thread/inject_items" },
+          },
+        });
+      }
+      rpcResult(id, {});
+      return;
+    }
+
+    // Prime's standalone RPC mode does not expose append_custom_message. Stop
+    // the idle runtime, append through Prime's native JSONL custom-message
+    // format, then resume so the in-memory context includes the injected item.
+    await this.unloadPrimeSessionForExternalMutation(threadId);
+    for (const text of texts) {
+      await this.catalog.appendContextMessage(
+        saved.sessionId,
+        "primecodex.injected_item",
+        text,
+      );
+    }
+    await this.ensurePrimeSession(threadId);
     rpcResult(id, {});
   }
 

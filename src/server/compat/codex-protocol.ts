@@ -54,7 +54,11 @@ export type CodexThread = {
   threadSource: null;
   agentNickname: null;
   agentRole: null;
-  gitInfo: null;
+  gitInfo: {
+    sha: string | null;
+    branch: string | null;
+    originUrl: string | null;
+  } | null;
   name: string | null;
   turns: CodexTurn[];
 };
@@ -211,7 +215,7 @@ export function threadFromPrimeSession(
     threadSource: null,
     agentNickname: null,
     agentRole: null,
-    gitInfo: null,
+    gitInfo: session.gitInfo ?? null,
     name: primeThreadTitle(session),
     turns: options.includeTurns ? turnsFromPrimeMessages(session.messages) : [],
   };

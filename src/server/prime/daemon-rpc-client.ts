@@ -236,6 +236,7 @@ export class PrimeAgentDaemonRpcClient {
       case "compact":
       case "set_thinking_level":
       case "set_session_name":
+      case "append_custom_message":
       case "steer":
       case "follow_up":
         await this.requestData(

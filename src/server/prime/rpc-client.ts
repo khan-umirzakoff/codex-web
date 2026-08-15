@@ -149,6 +149,10 @@ export class PrimeAgentRpcClient {
     this.process = null;
   }
 
+  isDaemonBacked(): boolean {
+    return this.daemon !== null;
+  }
+
   async killResidentSession(): Promise<boolean> {
     const daemon = this.daemon;
     if (!daemon) return false;
