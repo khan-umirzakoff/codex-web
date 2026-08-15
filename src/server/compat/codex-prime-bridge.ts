@@ -832,6 +832,7 @@ export class CodexPrimeBridge {
   ): Promise<void> {
     const session = await this.ensurePrimeSession(threadId, params);
     const saved = await this.requireSavedPrimeThread(threadId);
+    const allTurns = turnsFromPrimeMessages(saved.messages);
     const thread = threadFromPrimeSession(saved, {
       loaded: true,
       includeTurns: params.excludeTurns !== true,
@@ -842,21 +843,19 @@ export class CodexPrimeBridge {
       this.uiModel(session.state),
     );
     const initialTurnsPage = asRecord(params.initialTurnsPage);
-    const turns = thread.turns;
     const pageLimit =
       typeof initialTurnsPage.limit === "number" && initialTurnsPage.limit > 0
         ? Math.floor(initialTurnsPage.limit)
-        : turns.length;
+        : allTurns.length;
     rpcResult(id, {
       ...result,
-      initialTurnsPage:
-        params.initialTurnsPage && params.excludeTurns !== true
-          ? {
-              data: turns.slice(-pageLimit),
-              nextCursor: null,
-              backwardsCursor: null,
-            }
-          : null,
+      initialTurnsPage: params.initialTurnsPage
+        ? {
+            data: allTurns.slice(-pageLimit),
+            nextCursor: null,
+            backwardsCursor: null,
+          }
+        : null,
       turnsBackwardsCursor: null,
       itemsBackwardsCursor: null,
     });

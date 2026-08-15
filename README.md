@@ -16,11 +16,11 @@ npm run primecodex
 
 Then open <http://127.0.0.1:8214>.
 
-At the bottom of the sidebar, a native-style `Codex | Prime` segmented switch
-controls the whole app context. Codex mode shows Codex sessions, Codex models,
-and creates Codex tasks; Prime mode shows Prime Agent sessions, Prime-prefixed
-models, and creates Prime tasks. Switching is client-side and does not reload
-the page. Prime mode expands the sidebar history so all available non-archived
+The normal desktop product-mode slot at the top of the sidebar is reused as a
+native-looking `Codex` / `Prime` dropdown. Codex mode shows Codex sessions,
+Codex models, and creates Codex tasks; Prime mode shows Prime Agent sessions,
+Prime-prefixed models, and creates Prime tasks. Switching does not reload the
+page. Prime mode expands the sidebar history so all available non-archived
 Prime sessions are surfaced.
 
 Internally, creation of a visible Prime task is still armed as a one-shot
@@ -46,6 +46,22 @@ reasoning entries; IPython/bash work uses command cards with expandable output;
 IPython file diffs use normal Codex patch cards; and RLM child updates surface
 as subagent activity.
 
+### Syncing with the installed ChatGPT Desktop app
+
+On macOS, PrimeCodex can rebuild its browser bundle directly from the currently
+installed ChatGPT Desktop app and automatically use the matching bundled Codex
+app-server binary:
+
+```bash
+npm run sync:desktop
+```
+
+The installed `app.asar` is treated as generated upstream input and remains
+outside Git. PrimeCodex's bridge, browser shim, UI layer, and semantic transforms
+remain Git-tracked. The sync is staged and only swaps `scratch/asar` after all
+required transforms succeed, so a failed Desktop update does not destroy the
+last working generated bundle.
+
 ### Syncing this fork with codex-web
 
 Keep this repository's `origin` pointed at the fork and `upstream` pointed at
@@ -61,9 +77,11 @@ git push origin main
 ```
 
 Most PrimeCodex changes live in the compatibility bridge, server additions,
-and small renderer patches, so upstream updates can normally be merged while
-preserving the Prime Agent integration. If an upstream Codex renderer update
-changes a patched bundle, resolve/regenerate the affected patch before pushing.
+browser shim, and semantic renderer transforms, so upstream updates can
+normally be merged while preserving the Prime Agent integration. When the
+Desktop renderer changes, run `npm run sync:desktop`; a transform intentionally
+fails instead of silently patching the wrong code if one of its semantic anchors
+has changed.
 
 Prime Agent must already be installed and authenticated. Override its command
 or defaults when needed:

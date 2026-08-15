@@ -299,6 +299,8 @@ function createIpcMainStub(): {
 }
 
 let appReady = false;
+let appReadyPromise: Promise<void> | null = null;
+const appPathOverrides = new Map<string, string>();
 const commandLineSwitches = new Map<string, string>();
 const commandLineArguments: string[] = [];
 
@@ -327,7 +329,15 @@ const appBase = {
   },
   getPath(name: string): string {
     log("app.getPath", [name]);
-    return process.cwd();
+    const override = appPathOverrides.get(name);
+    if (override) return override;
+    const home = process.env.HOME ?? process.cwd();
+    const root =
+      process.env.PRIMECODEX_ELECTRON_DATA_DIR ??
+      `${home}/.primecodex/electron`;
+    if (name === "home") return home;
+    if (name === "temp") return process.env.TMPDIR ?? "/tmp";
+    return `${root}/${name}`;
   },
   getAppMetrics(): unknown[] {
     log("app.getAppMetrics", []);
@@ -335,7 +345,10 @@ const appBase = {
   },
   getAppPath(): string {
     log("app.getAppPath", []);
-    return process.cwd();
+    return (
+      (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath ??
+      process.cwd()
+    );
   },
   async getGPUInfo(infoLevel: string): Promise<{ gpuDevice: unknown[] }> {
     log("app.getGPUInfo", [infoLevel]);
@@ -346,6 +359,7 @@ const appBase = {
   },
   setPath(name: string, value: string): void {
     log("app.setPath", [name, value]);
+    appPathOverrides.set(name, value);
   },
   setAppUserModelId(value: string): void {
     log("app.setAppUserModelId", [value]);
@@ -360,8 +374,14 @@ const appBase = {
   },
   whenReady(): Promise<void> {
     log("app.whenReady", []);
-    appReady = true;
-    return Promise.resolve();
+    if (appReady) return Promise.resolve();
+    appReadyPromise ??= new Promise<void>((resolve) => {
+      setImmediate(() => {
+        appReady = true;
+        resolve();
+      });
+    });
+    return appReadyPromise;
   },
   commandLine: {
     appendSwitch(name: string, value?: string): void {
@@ -417,6 +437,7 @@ class BrowserWindow {
   static focusedWindow: BrowserWindow | null = null;
   id: number;
   private destroyed = false;
+  private visible = true;
   private title = "Codex";
   private bounds = { x: 0, y: 0, width: 1280, height: 820 };
   webContents: Record<string, unknown>;
@@ -425,6 +446,11 @@ class BrowserWindow {
   constructor(...args: unknown[]) {
     log("new BrowserWindow", args);
     this.id = BrowserWindow.nextId++;
+    const options =
+      args[0] && typeof args[0] === "object"
+        ? (args[0] as { show?: boolean })
+        : undefined;
+    this.visible = options?.show !== false;
     this.emitter = createEmitterStub(`BrowserWindow#${this.id}`);
 
     const webContentsEmitter = createEmitterStub(
@@ -440,8 +466,8 @@ class BrowserWindow {
         getURL: (): string => {
           log(`BrowserWindow#${this.id}.webContents.getURL`, []);
           return String(
-            (this.webContents.mainFrame as { url?: string } | undefined)
-              ?.url ?? "",
+            (this.webContents.mainFrame as { url?: string } | undefined)?.url ??
+              "",
           );
         },
         isDestroyed: (): boolean => this.destroyed,
@@ -483,16 +509,18 @@ class BrowserWindow {
       },
     );
 
-    BrowserWindow.allWindows.push(this);
-    BrowserWindow.focusedWindow = this;
-    return new Proxy(this, {
+    const proxy = new Proxy(this, {
       get: (target, prop) => {
+        if (prop === "then") return undefined;
         if (prop in target) {
           return target[prop as keyof typeof target];
         }
         return createDeepStub(`BrowserWindow#${target.id}.${String(prop)}`);
       },
     });
+    BrowserWindow.allWindows.push(proxy);
+    BrowserWindow.focusedWindow = proxy;
+    return proxy;
   }
 
   static getAllWindows(): BrowserWindow[] {
@@ -502,10 +530,7 @@ class BrowserWindow {
 
   static getFocusedWindow(): BrowserWindow | null {
     log("BrowserWindow.getFocusedWindow", []);
-    if (
-      BrowserWindow.focusedWindow &&
-      !BrowserWindow.focusedWindow.destroyed
-    ) {
+    if (BrowserWindow.focusedWindow && !BrowserWindow.focusedWindow.destroyed) {
       return BrowserWindow.focusedWindow;
     }
     return BrowserWindow.getAllWindows()[0] ?? null;
@@ -560,6 +585,7 @@ class BrowserWindow {
   destroy(): void {
     log(`BrowserWindow#${this.id}.destroy`, []);
     this.destroyed = true;
+    this.visible = false;
     if (BrowserWindow.focusedWindow === this) {
       BrowserWindow.focusedWindow = null;
     }
@@ -574,6 +600,11 @@ class BrowserWindow {
   isFocused(): boolean {
     log(`BrowserWindow#${this.id}.isFocused`, []);
     return BrowserWindow.focusedWindow === this && !this.destroyed;
+  }
+
+  isVisible(): boolean {
+    log(`BrowserWindow#${this.id}.isVisible`, []);
+    return this.visible && !this.destroyed;
   }
 
   removeMenu(): void {
@@ -612,10 +643,14 @@ class BrowserWindow {
 
   show(): void {
     log(`BrowserWindow#${this.id}.show`, []);
+    this.visible = true;
+    this.emitter.emit("show");
   }
 
   hide(): void {
     log(`BrowserWindow#${this.id}.hide`, []);
+    this.visible = false;
+    this.emitter.emit("hide");
   }
 
   focus(): void {
@@ -753,6 +788,10 @@ const dialog = {
     log("dialog.showMessageBox", args);
     return { response: 0 };
   },
+  showErrorBox(title: string, content: string): void {
+    log("dialog.showErrorBox", [title, content]);
+    console.error(`[dialog.showErrorBox] ${title}: ${content}`);
+  },
 };
 
 const crashReporter = {
@@ -817,7 +856,40 @@ const nativeImage = {
     };
   },
 };
-const powerMonitor = createEmitterStub("powerMonitor");
+const systemPreferences = {
+  async getFontFamilies(): Promise<string[]> {
+    log("systemPreferences.getFontFamilies", []);
+    return [
+      "Arial",
+      "Helvetica",
+      "Times New Roman",
+      "Courier New",
+      "Menlo",
+      "Monaco",
+      "SF Pro",
+      "SF Mono",
+    ];
+  },
+  getMediaAccessStatus(): "granted" {
+    log("systemPreferences.getMediaAccessStatus", []);
+    return "granted";
+  },
+  async askForMediaAccess(): Promise<boolean> {
+    log("systemPreferences.askForMediaAccess", []);
+    return true;
+  },
+};
+const powerMonitor = {
+  ...createEmitterStub("powerMonitor"),
+  getSystemIdleState(idleThreshold: number): "active" | "idle" | "locked" {
+    log("powerMonitor.getSystemIdleState", [idleThreshold]);
+    return "active";
+  },
+  isOnBatteryPower(): boolean {
+    log("powerMonitor.isOnBatteryPower", []);
+    return false;
+  },
+};
 const screen = {
   ...createEmitterStub("screen"),
   getAllDisplays(): Array<{
@@ -873,6 +945,13 @@ const protocol = {
   },
 };
 function createSessionStub(label: string): {
+  cookies: {
+    get: (filter: Record<string, unknown>) => Promise<unknown[]>;
+    off: (event: string, listener: StubListener) => unknown;
+    on: (event: string, listener: StubListener) => unknown;
+    once: (event: string, listener: StubListener) => unknown;
+    removeListener: (event: string, listener: StubListener) => unknown;
+  };
   getUserAgent: () => string;
   loadExtension: (extensionPath: string) => Promise<{
     id: string;
@@ -893,7 +972,18 @@ function createSessionStub(label: string): {
   };
 } {
   const emitter = createEmitterStub(label);
+  const cookiesEmitter = createEmitterStub(`${label}.cookies`);
   return {
+    cookies: {
+      async get(filter: Record<string, unknown>): Promise<unknown[]> {
+        log(`${label}.cookies.get`, [filter]);
+        return [];
+      },
+      off: cookiesEmitter.off,
+      on: cookiesEmitter.on,
+      once: cookiesEmitter.once,
+      removeListener: cookiesEmitter.removeListener,
+    },
     async loadExtension(extensionPath: string): Promise<{
       id: string;
       name: string;
@@ -933,14 +1023,19 @@ function createSessionStub(label: string): {
     },
   };
 }
-const partitionSessions = new Map<string, ReturnType<typeof createSessionStub>>();
+const partitionSessions = new Map<
+  string,
+  ReturnType<typeof createSessionStub>
+>();
 const session = {
   defaultSession: createSessionStub("session.defaultSession"),
   fromPartition(partition: string): ReturnType<typeof createSessionStub> {
     log("session.fromPartition", [partition]);
     let partitionSession = partitionSessions.get(partition);
     if (!partitionSession) {
-      partitionSession = createSessionStub(`session.fromPartition(${partition})`);
+      partitionSession = createSessionStub(
+        `session.fromPartition(${partition})`,
+      );
       partitionSessions.set(partition, partitionSession);
     }
     return partitionSession;
@@ -988,6 +1083,7 @@ const electronModule = new Proxy(
     protocol,
     screen,
     session,
+    systemPreferences,
     Tray,
     utilityProcess,
     WebContentsView,
@@ -1021,6 +1117,7 @@ export {
   protocol,
   screen,
   session,
+  systemPreferences,
   Tray,
   utilityProcess,
   WebContentsView,

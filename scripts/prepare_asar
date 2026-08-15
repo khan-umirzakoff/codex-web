@@ -1,11 +1,37 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
-unzip -o "$HOSTED_CODEX_APP_ZIP" -d scratch/
-asar extract "scratch/ChatGPT.app/Contents/Resources/app.asar" "scratch/asar"
-cp assets/* scratch/asar/webview/
-PWA_SOURCE_ICON="scratch/asar/webview/assets/app-D0g8sCle.png"
-PWA_TARGET_ICON="scratch/asar/webview/assets/pwa-icon-512.png"
+SCRATCH_DIR="${SCRATCH_DIR:-scratch}"
+ASAR_DIR="$SCRATCH_DIR/asar"
+
+mkdir -p "$SCRATCH_DIR"
+rm -rf "$ASAR_DIR"
+
+if [[ -n "${SOURCE_APP_ASAR:-}" ]]; then
+  APP_ASAR="$SOURCE_APP_ASAR"
+elif [[ -n "${HOSTED_CODEX_APP_ZIP:-}" ]]; then
+  rm -rf "$SCRATCH_DIR/ChatGPT.app"
+  unzip -o "$HOSTED_CODEX_APP_ZIP" -d "$SCRATCH_DIR/"
+  APP_ASAR="$SCRATCH_DIR/ChatGPT.app/Contents/Resources/app.asar"
+else
+  echo "prepare_asar requires SOURCE_APP_ASAR or HOSTED_CODEX_APP_ZIP" >&2
+  exit 2
+fi
+
+if [[ ! -f "$APP_ASAR" ]]; then
+  echo "ChatGPT app.asar not found: $APP_ASAR" >&2
+  exit 2
+fi
+
+asar extract "$APP_ASAR" "$ASAR_DIR"
+cp assets/* "$ASAR_DIR/webview/"
+
+PWA_SOURCE_ICON="${PWA_SOURCE_ICON:-$(find "$ASAR_DIR/webview/assets" -maxdepth 1 -type f -name 'app-*.png' -print | head -n 1)}"
+if [[ -z "$PWA_SOURCE_ICON" || ! -f "$PWA_SOURCE_ICON" ]]; then
+  echo "Could not locate the ChatGPT app icon in $ASAR_DIR/webview/assets" >&2
+  exit 2
+fi
+PWA_TARGET_ICON="$ASAR_DIR/webview/assets/pwa-icon-512.png"
 PWA_ICON_SIZE=512
 PWA_TOTAL_PADDING_PERCENT=25
 PWA_CONTENT_SIZE=$((PWA_ICON_SIZE * (100 - PWA_TOTAL_PADDING_PERCENT) / 100))
@@ -13,31 +39,43 @@ PWA_PADDING_TOTAL=$((PWA_ICON_SIZE - PWA_CONTENT_SIZE))
 PWA_PADDING_BEFORE=$((PWA_PADDING_TOTAL / 2))
 PWA_PADDING_AFTER=$((PWA_PADDING_TOTAL - PWA_PADDING_BEFORE))
 sharp -i "$PWA_SOURCE_ICON" -o "$PWA_TARGET_ICON" -f png resize "$PWA_CONTENT_SIZE" "$PWA_CONTENT_SIZE" --fit inside -- flatten white -- extend "$PWA_PADDING_BEFORE" "$PWA_PADDING_AFTER" "$PWA_PADDING_BEFORE" "$PWA_PADDING_AFTER" --background white -- removeAlpha
-if [[ -n "${DEV:-}" ]]; then
-  prettier --ignore-path /dev/null --ignore-unknown --write "scratch/asar"
+if [[ -n "${USE_SEMANTIC_TRANSFORMS:-}" ]]; then
+  node ./scripts/apply_webview_transforms.mjs "$ASAR_DIR"
+elif [[ -n "${DEV:-}" ]]; then
+  prettier --ignore-path /dev/null --ignore-unknown --write "$ASAR_DIR"
 else
   patched_files=()
   while IFS= read -r patched_file; do
-    patched_files+=("$patched_file")
+    patched_files+=("$ASAR_DIR/$patched_file")
   done < <(
-    awk '/^\+\+\+ b\//{sub(/^\+\+\+ b\//, "scratch/asar/"); print}' patches/*.patch | sort -u
+    awk '/^\+\+\+ b\//{sub(/^\+\+\+ b\//, ""); print}' patches/*.patch | sort -u
   )
   prettier --ignore-path /dev/null --ignore-unknown --write "${patched_files[@]}"
 fi
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-remove-csp.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-style.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-preload.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-favicon.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-pwa.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-thread-title.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-initial-route.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-electron-shim-close-sidebar.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-prosemirror-inputmode.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-use-atfs-for-local-files.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-statsig-override-adapter.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-prompt-search-param.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-prime-backend-toggle.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/webview-prime-project-assignment-fallback.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/sentry-disable-shell.patch
-patch --batch --forward --strip 1 --directory scratch/asar < patches/sentry-disable-webview.patch
-rm -rf scratch/asar/node_modules/better-sqlite3
+
+PATCHES=(
+  patches/webview-remove-csp.patch
+  patches/webview-style.patch
+  patches/webview-preload.patch
+  patches/webview-favicon.patch
+  patches/webview-pwa.patch
+  patches/webview-thread-title.patch
+  patches/webview-initial-route.patch
+  patches/webview-electron-shim-close-sidebar.patch
+  patches/webview-prosemirror-inputmode.patch
+  patches/webview-use-atfs-for-local-files.patch
+  patches/webview-statsig-override-adapter.patch
+  patches/webview-prompt-search-param.patch
+  patches/webview-prime-backend-toggle.patch
+  patches/webview-prime-project-assignment-fallback.patch
+  patches/sentry-disable-shell.patch
+  patches/sentry-disable-webview.patch
+)
+
+if [[ -z "${USE_SEMANTIC_TRANSFORMS:-}" ]]; then
+  for patch_file in "${PATCHES[@]}"; do
+    patch --batch --forward --strip 1 --directory "$ASAR_DIR" < "$patch_file"
+  done
+fi
+
+rm -rf "$ASAR_DIR/node_modules/better-sqlite3"

@@ -3,7 +3,10 @@
   const SESSIONS_URL = "/__backend/primecodex/sessions";
   const MODE_SWITCH_ATTR = "data-primecodex-mode-switch";
   const MODE_MENU_ATTR = "data-primecodex-mode-menu";
-  const MODE_SWITCH_VERSION = "native-top-v1";
+  const MODE_STYLE_ATTR = "data-primecodex-mode-style";
+  const MODE_SWITCH_VERSION = "native-slot-v2";
+  const NATIVE_MODE_TRIGGER_SELECTOR =
+    'button[aria-label^="Switch mode, current mode:"]';
   let state = null;
   let updating = false;
   let pendingBackend = null;
@@ -160,13 +163,22 @@
     );
     for (const item of candidates) {
       const text = (item.innerText || "").trim().replace(/\s+/g, " ");
+      const menu = item.closest('[role="menu"]');
+      const menuText = (menu?.innerText || "").trim();
       const isPrimeModel = text.startsWith("Prime · GPT-");
+      const isHybridModelMenu = menuText.includes("Prime · GPT-");
+
+      if (isHybridModelMenu) {
+        const visible = showPrime ? isPrimeModel : !isPrimeModel;
+        item.style.display = visible ? "" : "none";
+        item.toggleAttribute("data-primecodex-model-hidden", !visible);
+        continue;
+      }
+
       const isNativeModel =
         !isPrimeModel && (/^GPT-/.test(text) || /^o\d/i.test(text));
       if (!isPrimeModel && !isNativeModel) continue;
 
-      const menu = item.closest('[role="menu"]');
-      const menuText = (menu?.innerText || "").trim();
       const isReasoningMenu =
         menuText.includes("Reasoning") && menuText.includes("Extra High");
       if (isReasoningMenu) {
@@ -404,12 +416,31 @@
   function removeModeSwitch() {
     document.querySelector(`[${MODE_SWITCH_ATTR}]`)?.remove();
     document.querySelector(`[${MODE_MENU_ATTR}]`)?.remove();
+    document.querySelector(`[${MODE_STYLE_ATTR}]`)?.remove();
+    for (const nativeTrigger of document.querySelectorAll(
+      "[data-primecodex-native-mode-trigger]",
+    )) {
+      nativeTrigger.style.removeProperty("display");
+      nativeTrigger.removeAttribute("data-primecodex-native-mode-trigger");
+    }
     const scrollArea = document.querySelector(
       "aside.app-shell-left-panel .vertical-scroll-fade-mask",
     );
     if (scrollArea?.style.paddingBottom.includes("52px")) {
       scrollArea.style.removeProperty("padding-bottom");
     }
+  }
+
+  function ensureModeSwitchStyle() {
+    if (document.querySelector(`[${MODE_STYLE_ATTR}]`)) return;
+    const style = document.createElement("style");
+    style.setAttribute(MODE_STYLE_ATTR, "");
+    style.textContent = `
+      aside.app-shell-left-panel button[aria-label^="Switch mode, current mode:"] {
+        display: none !important;
+      }
+    `;
+    document.head.appendChild(style);
   }
 
   function observeModeSwitchHeader(header) {
@@ -421,7 +452,7 @@
         queueMicrotask(ensureModeSwitch);
       }
     });
-    modeSwitchObserver.observe(header, { childList: true });
+    modeSwitchObserver.observe(header, { childList: true, subtree: true });
   }
 
   function ensureModeSwitch() {
@@ -442,7 +473,19 @@
       removeModeSwitch();
       return;
     }
+    ensureModeSwitchStyle();
     observeModeSwitchHeader(header);
+
+    const nativeTrigger = [
+      ...header.querySelectorAll(NATIVE_MODE_TRIGGER_SELECTOR),
+    ].find(
+      (candidate) => !candidate.hasAttribute("data-primecodex-mode-trigger"),
+    );
+    const nativeHost = nativeTrigger?.parentElement ?? null;
+    if (nativeTrigger) {
+      nativeTrigger.setAttribute("data-primecodex-native-mode-trigger", "");
+      nativeTrigger.style.setProperty("display", "none", "important");
+    }
 
     let control = document.querySelector(`[${MODE_SWITCH_ATTR}]`);
     if (control?.dataset.primecodexModeSwitchVersion !== MODE_SWITCH_VERSION) {
@@ -455,31 +498,56 @@
       control = document.createElement("div");
       control.setAttribute(MODE_SWITCH_ATTR, "");
       control.dataset.primecodexModeSwitchVersion = MODE_SWITCH_VERSION;
-      control.className = "ml-2 flex h-8 shrink-0 items-center";
+      control.className = nativeHost
+        ? "contents"
+        : "ml-2 flex h-8 shrink-0 items-center";
 
-      const trigger = document.createElement("button");
+      const trigger = nativeTrigger
+        ? nativeTrigger.cloneNode(true)
+        : document.createElement("button");
       trigger.type = "button";
       trigger.dataset.primecodexModeTrigger = "";
+      trigger.removeAttribute("data-primecodex-native-mode-trigger");
+      trigger.removeAttribute("id");
+      trigger.removeAttribute("aria-controls");
+      trigger.removeAttribute("data-state");
+      trigger.style.removeProperty("display");
       trigger.setAttribute("aria-haspopup", "menu");
       trigger.setAttribute("aria-expanded", "false");
-      trigger.className =
-        "flex h-8 min-w-0 cursor-interaction items-center gap-1 rounded-xl px-2 !text-[17px] !leading-6 font-medium text-token-foreground hover:bg-token-list-hover-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-0";
-      trigger.style.marginInlineStart = "-8px";
-
-      const label = document.createElement("span");
-      label.dataset.primecodexModeLabel = "";
-      label.className =
-        "truncate font-openai-sans font-semibold text-token-foreground";
-      trigger.append(label, chevronIcon());
+      if (!nativeTrigger) {
+        trigger.className =
+          "flex h-8 min-w-0 cursor-interaction items-center gap-1 rounded-xl px-2 !text-[17px] !leading-6 font-medium text-token-foreground hover:bg-token-list-hover-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-0";
+        trigger.style.marginInlineStart = "-8px";
+        const label = document.createElement("span");
+        label.className =
+          "truncate font-openai-sans font-semibold text-token-foreground";
+        trigger.append(label, chevronIcon());
+      }
+      const label =
+        trigger.querySelector("span.font-openai-sans.font-semibold") ??
+        trigger.querySelector("span");
+      if (label) label.dataset.primecodexModeLabel = "";
       trigger.addEventListener("click", (event) => {
+        event.preventDefault();
         event.stopPropagation();
         toggleModeMenu(control);
       });
       control.appendChild(trigger);
-      header.prepend(control);
+      if (nativeHost && nativeTrigger) {
+        nativeHost.insertBefore(control, nativeTrigger);
+      } else {
+        header.prepend(control);
+      }
       if (!menu) menu = createModeMenu();
-    } else if (control.parentElement !== header) {
-      header.prepend(control);
+    } else {
+      const expectedHost = nativeHost ?? header;
+      if (control.parentElement !== expectedHost) {
+        if (nativeHost && nativeTrigger) {
+          nativeHost.insertBefore(control, nativeTrigger);
+        } else {
+          header.prepend(control);
+        }
+      }
     }
     if (!menu) menu = createModeMenu();
 

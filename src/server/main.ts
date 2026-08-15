@@ -132,6 +132,8 @@ type BridgedMessagePort = {
 
 class WebSocketMessagePort implements BridgedMessagePort {
   private closed = false;
+  private started = false;
+  private readonly pendingMessages: unknown[] = [];
   private readonly listeners = new Map<string, Set<MessagePortListener>>();
 
   constructor(
@@ -141,6 +143,9 @@ class WebSocketMessagePort implements BridgedMessagePort {
   ) {}
 
   on(event: string, listener: MessagePortListener): this {
+    if (process.env.PRIMECODEX_DEBUG_PORTS === "1") {
+      console.log(`[ipc-port:${this.portId}] on ${event}`);
+    }
     const listeners = this.listeners.get(event) ?? new Set();
     listeners.add(listener);
     this.listeners.set(event, listeners);
@@ -152,6 +157,9 @@ class WebSocketMessagePort implements BridgedMessagePort {
     if (this.closed) {
       return;
     }
+    if (process.env.PRIMECODEX_DEBUG_PORTS === "1") {
+      console.log(`[ipc-port:${this.portId}] postMessage`, data);
+    }
     this.sendToRenderer({
       type: "message-port-message",
       portId: this.portId,
@@ -159,7 +167,20 @@ class WebSocketMessagePort implements BridgedMessagePort {
     });
   }
 
-  start(): void {}
+  start(): void {
+    if (this.closed || this.started) {
+      return;
+    }
+    if (process.env.PRIMECODEX_DEBUG_PORTS === "1") {
+      console.log(
+        `[ipc-port:${this.portId}] start pending=${this.pendingMessages.length}`,
+      );
+    }
+    this.started = true;
+    for (const data of this.pendingMessages.splice(0)) {
+      this.emit("message", { data });
+    }
+  }
 
   close(): void {
     if (!this.markClosed()) {
@@ -175,13 +196,17 @@ class WebSocketMessagePort implements BridgedMessagePort {
     if (this.closed) {
       return;
     }
-    const listeners = this.listeners.get("message");
-    if (!listeners || listeners.size === 0) {
+    if (process.env.PRIMECODEX_DEBUG_PORTS === "1") {
+      console.log(
+        `[ipc-port:${this.portId}] receive started=${this.started}`,
+        data,
+      );
+    }
+    if (!this.started) {
+      this.pendingMessages.push(data);
       return;
     }
-    for (const listener of listeners) {
-      listener({ data });
-    }
+    this.emit("message", { data });
   }
 
   disconnect(): void {
@@ -746,7 +771,15 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
       path.resolve(__dirname, "../../scratch/asar/package.json"),
       "utf8",
     ),
-  );
+  ) as {
+    version: string;
+    codexBuildFlavor?: string;
+    codexBuildNumber?: string;
+  };
+
+  if (!process.env.BUILD_FLAVOR && packageJson.codexBuildFlavor) {
+    process.env.BUILD_FLAVOR = packageJson.codexBuildFlavor;
+  }
 
   globalThis.__CODEX_SHIM_VALUES__ = {
     version: packageJson.version,

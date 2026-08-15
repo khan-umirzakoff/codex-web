@@ -11,6 +11,8 @@
   "bin": "src/server/main.js",
   "scripts": {
     "prepare": "./scripts/prepare && npm run build:browser && npm run build:server",
+    "sync:desktop": "bash ./scripts/sync_desktop && npm run build:browser && npm run build:server",
+    "inspect:desktop": "node ./scripts/inspect_desktop.mjs",
     "build": "npm run prepare:asar && npm run build:browser && npm run build:server",
     "launch:unpacked:server": "http-server ./scratch/asar/webview -a localhost -p 5175 -c-1",
     "launch:unpacked": "NODE_ENV=development electron ./scratch/asar --remote-debugging-port=9222",

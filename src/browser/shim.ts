@@ -396,6 +396,19 @@ if (initialRoute.browserPath) {
 }
 
 electronShim.initialSidebarState = initialSidebarState;
+electronShim.closeSidebar = () => {
+  const aside = document.querySelector("aside.app-shell-left-panel");
+  if (
+    !(aside instanceof HTMLElement) ||
+    aside.getBoundingClientRect().width < 2
+  ) {
+    return;
+  }
+  const trigger = document.querySelector(
+    '[data-app-shell-sidebar-trigger="true"], [data-app-shell-sidebar-trigger]',
+  );
+  if (trigger instanceof HTMLElement) trigger.click();
+};
 electronShim.onMemoryNavigationChanged = (navigation) => {
   const path = navigation.location.pathname;
   if (
@@ -556,6 +569,20 @@ export const ipcRenderer = {
         },
         local_remote_control_client_id: null,
         pending_worktrees: [],
+      };
+    }
+
+    if (channel === "codex_desktop:get-initial-sidebar-bootstrap") {
+      return {
+        globalStateEntries: [],
+        workspaceRootOptions: {
+          roots: [],
+          labels: {},
+        },
+        projectlessWorkspaceRoot: {
+          workspaceRoot: null,
+        },
+        catalogEntries: [],
       };
     }
 

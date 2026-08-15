@@ -20,6 +20,15 @@ async function executable(candidate: string): Promise<boolean> {
 async function realCodexPath(): Promise<string> {
   const explicit = process.env.PRIMECODEX_REAL_CODEX_PATH;
   if (explicit) return explicit;
+
+  const desktopAppPath =
+    process.env.PRIMECODEX_DESKTOP_APP_PATH ??
+    (process.platform === "darwin" ? "/Applications/ChatGPT.app" : undefined);
+  if (desktopAppPath) {
+    const bundled = path.join(desktopAppPath, "Contents", "Resources", "codex");
+    if (await executable(bundled)) return bundled;
+  }
+
   const ownPath = path.resolve(process.argv[1] ?? "");
   for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
     if (!directory) continue;

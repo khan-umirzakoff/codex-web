@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euxo pipefail
+
+CHATGPT_APP_PATH="${CHATGPT_APP_PATH:-/Applications/ChatGPT.app}"
+APP_ASAR="$CHATGPT_APP_PATH/Contents/Resources/app.asar"
+INFO_PLIST="$CHATGPT_APP_PATH/Contents/Info.plist"
+TARGET_SCRATCH_DIR="${SCRATCH_DIR:-scratch}"
+STAGING_DIR="${TARGET_SCRATCH_DIR}.sync.$$"
+OLD_ASAR_DIR="${TARGET_SCRATCH_DIR}/asar.previous.$$"
+
+cleanup() {
+  rm -rf "$STAGING_DIR"
+}
+trap cleanup EXIT
+
+if [[ ! -f "$APP_ASAR" ]]; then
+  echo "ChatGPT Desktop app.asar not found: $APP_ASAR" >&2
+  exit 2
+fi
+
+APP_VERSION="unknown"
+if [[ -f "$INFO_PLIST" && -x /usr/libexec/PlistBuddy ]]; then
+  APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST" 2>/dev/null || true)"
+fi
+
+echo "Syncing PrimeCodex from ChatGPT Desktop ${APP_VERSION:-unknown}: $CHATGPT_APP_PATH"
+SOURCE_APP_ASAR="$APP_ASAR" SCRATCH_DIR="$STAGING_DIR" USE_SEMANTIC_TRANSFORMS=1 bash ./scripts/prepare_asar
+printf '%s\n' "${APP_VERSION:-unknown}" > "$STAGING_DIR/desktop-version.txt"
+
+mkdir -p "$TARGET_SCRATCH_DIR"
+rm -rf "$OLD_ASAR_DIR"
+if [[ -d "$TARGET_SCRATCH_DIR/asar" ]]; then
+  mv "$TARGET_SCRATCH_DIR/asar" "$OLD_ASAR_DIR"
+fi
+if mv "$STAGING_DIR/asar" "$TARGET_SCRATCH_DIR/asar"; then
+  rm -rf "$OLD_ASAR_DIR"
+else
+  rm -rf "$TARGET_SCRATCH_DIR/asar"
+  if [[ -d "$OLD_ASAR_DIR" ]]; then
+    mv "$OLD_ASAR_DIR" "$TARGET_SCRATCH_DIR/asar"
+  fi
+  exit 1
+fi
+mv "$STAGING_DIR/desktop-version.txt" "$TARGET_SCRATCH_DIR/desktop-version.txt"
