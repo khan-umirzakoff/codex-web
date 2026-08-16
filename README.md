@@ -95,8 +95,28 @@ npm run primecodex
 ```
 
 Prime Agent executes with the current user's permissions; this UI is not a
-security sandbox. Keep the default localhost bind for local use. Put a private
-authenticated tunnel such as Tailscale in front of it before remote access.
+security sandbox. Keep the default localhost bind for local use. Put an
+authenticated private-access layer in front of it before remote access.
+
+### Remote access with Cloudflare Tunnel
+
+PrimeCodex can stay bound to `127.0.0.1:8214`; `cloudflared` may publish that
+loopback service without opening an inbound port on the Mac. For a remotely
+managed tunnel, add a **Published application** route in Cloudflare and map a
+dedicated hostname such as `prime.example.com` to:
+
+```text
+http://127.0.0.1:8214
+```
+
+The browser shim derives its backend WebSocket URL from the page origin, so an
+HTTPS hostname automatically uses `wss://<hostname>/__backend/ipc`.
+
+Do **not** publish this hostname without authentication. Protect the entire
+hostname with a Cloudflare Access self-hosted application (or an equivalent
+identity-aware proxy) and restrict it to the intended user(s). Anyone who can
+reach PrimeCodex should be treated as able to run agent actions with the local
+user's permissions.
 
 ## motivation
 
