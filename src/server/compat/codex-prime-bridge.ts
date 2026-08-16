@@ -1738,11 +1738,6 @@ export class CodexPrimeBridge {
     if (!mapped)
       throw new Error("Prime Agent did not return an active thread goal");
     rpcResult(id, { goal: mapped });
-    notify("thread/goal/updated", {
-      threadId,
-      turnId: session.currentTurn?.id ?? null,
-      goal: mapped,
-    });
   }
 
   private async handlePrimeThreadGoalClear(
@@ -1763,7 +1758,6 @@ export class CodexPrimeBridge {
     }
     await this.runPrimeGoalCommand(session, "/goal clear");
     rpcResult(id, { cleared: true });
-    notify("thread/goal/cleared", { threadId });
   }
 
   private async handlePrimeTurnStart(
