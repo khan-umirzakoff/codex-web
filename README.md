@@ -16,6 +16,9 @@ npm run primecodex
 
 Then open <http://127.0.0.1:8214>.
 
+For remote deployment, Cloudflare Access, update procedures, version checks, and
+recovery, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+
 The normal desktop product-mode slot at the top of the sidebar is reused as a
 native-looking `Codex` / `Prime` dropdown. Codex mode shows Codex sessions,
 Codex models, and creates Codex tasks; Prime mode shows Prime Agent sessions,

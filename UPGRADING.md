@@ -1,99 +1,63 @@
-# upgrading
+# Upgrading PrimeCodex
 
-instructions for upgrading codex-web to point at a new version of upstream
-Codex Desktop.
+PrimeCodex has three independent update sources:
 
-## backing up
+1. the official ChatGPT/Codex Desktop application;
+2. Prime Agent;
+3. the upstream `0xcaff/codex-web` Git repository.
 
-we will start by generating a scratch directory and backing it up. first, let's
-get the `scratch` directory to a known state by running the following
+For the complete operational procedure, Cloudflare deployment notes, version checks, smoke tests, rollback, and session-safety rules, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
-```bash
-rm -rf scratch scratch-backup # remove existing past scratch directories to start from clean state
-DEV=1 nix develop --command yarn run prepare:asar 
-mv scratch scratch-backup
-```
+## ChatGPT / Codex Desktop
 
-the `scratch-backup` directory holds the patched, working version of codex-web.
-we will use this when moving the patches over to the new version to understand
-the context the patches were being applied in.
-
-## updating urls
-
-there are a few places to update next.
-
-1. `appVersion` in default.nix and `hash` in `codexZip`.
-2. `APP_VERSION` in ./scripts/prepare
-
-then temporarily comment out the patch lines in ./scripts/prepare_asar and run
+Update the official Desktop app normally, then rebuild PrimeCodex from the currently installed app:
 
 ```bash
-DEV=1 nix develop --command yarn run prepare:asar 
-cp -r scratch scratch-new-version-unmodified
+cd ~/PROJECTS/PrimeCodex
+npm run sync:desktop
 ```
 
-## upgrading the codex-cli version
+The Desktop `app.asar` is generated upstream input and is intentionally not committed to Git. `sync:desktop` extracts the installed app into staging, applies Git-tracked PrimeCodex semantic transforms, and only replaces the current generated bundle after the transform stage succeeds.
 
-this part can be run concurrently with the rest of the upgrade process. make
-sure to wait for its completion before doing validation. run it in a subagent.
+PrimeCodex automatically prefers the Codex app-server binary bundled with the installed ChatGPT Desktop application on macOS so the renderer and protocol stay aligned.
 
-run the following to get the version of the new codex-cli
+After syncing:
 
 ```bash
-scratch/ChatGPT.app/Contents/Resources/codex --version
+npm run primecodex
 ```
 
-then update the `nix/codex/default.nix` file's `version` field and hashes to
-point to the new version.
+Smoke-test both native Codex and Prime mode before continuing feature work.
 
-## porting over patches
-
-now we have a few folders
-
-* `scratch-backup`: patches applied on top of old version of Codex Desktop
-* `scratch-new-version-unmodified`: plain extracted new version of Codex Desktop
-* `scratch`: working copy we will be modifying
-
-now carefully look at the patches in `patches/` and how they were applied in
-`scratch-backup` and bring the changes over to `scratch`. apply them directly
-in-tree first. don't worry immediately about updating the patches yet.
-
-## updating patches
-
-once the patches have been made in `scratch`, diff the changes in `scratch`
-against `scratch-new-version-unmodified` and update the patches in `patches/`.
-always generate the patches by running `diff` and always avoid writing the
-patches manually as it's very easy to get them wrong.
-
-once that is done, uncomment the patch lines in `scripts/prepare_asar` and run
+## Prime Agent
 
 ```bash
-mv scratch scratch-patched-inplace
-rm -rf scratch
-DEV=1 nix develop --command yarn run prepare:asar 
+prime-agent --version
+prime-agent update
 ```
 
-then diff `./scratch-patched-inplace` with the resulting `./scratch` to validate
-the patches were applied as expected.
+Use `prime-agent update --force` only when a forced reinstall/update is needed.
 
-## validation
+Prime Agent session history is stored separately under `~/.prime/agent/sessions`.
 
-to validate things are still working, we'll first validate the server, then the
-client. before starting this step, make sure to wait for the
-`upgrading the codex-cli version` subagent to finish.
+## Upstream codex-web
 
-to validate the server, run the following
+Keep `origin` pointed at the PrimeCodex fork and `upstream` pointed at `0xcaff/codex-web`:
 
 ```bash
-nix develop --command yarn server
+git fetch upstream
+git checkout main
+git merge upstream/main
+npm install
+npm run sync:desktop
+npm run build:server
+npm run build:browser
 ```
 
-next validate the client by opening a browser window to `http://localhost:8214`
-and validating things show up on the page.
+After validation:
 
-look in the console for errors. also, look on the screen to see whether any
-error dialogs popped up. sometimes errors occur, but they're silent and exhibit
-as loading taking forever (more than 1m). look out for that case too.
+```bash
+git push origin main
+```
 
-if there are errors, bring them to the users attention and we will decide how to
-proceed.
+Do not commit `scratch/asar`. Merge Git source with Git; regenerate the official Desktop bundle through `sync:desktop`.
