@@ -37,6 +37,7 @@ type IpcMainBridgeState = {
     channel: string;
     args: unknown[];
   }) => void;
+  initialSharedObjects?: Record<string, unknown>;
   handleRendererInvoke?: (
     channel: string,
     args: unknown[],
@@ -290,6 +291,30 @@ function createIpcMainStub(): {
     ): void {
       log("ipcMain.handle", [channel, handler]);
       handlers.set(channel, handler);
+      if (channel === "codex_desktop:message-from-view") {
+        const initialSharedObjects = bridgeState.initialSharedObjects;
+        if (
+          initialSharedObjects &&
+          Object.keys(initialSharedObjects).length > 0
+        ) {
+          queueMicrotask(() => {
+            for (const [key, value] of Object.entries(initialSharedObjects)) {
+              Promise.resolve(
+                handler(createIpcMainEvent(), {
+                  type: "shared-object-set",
+                  key,
+                  value,
+                }),
+              ).catch((error) => {
+                console.error(
+                  `[electron-main-stub] failed to seed shared object ${key}`,
+                  error,
+                );
+              });
+            }
+          });
+        }
+      }
     },
     removeHandler(channel: string): void {
       log("ipcMain.removeHandler", [channel]);

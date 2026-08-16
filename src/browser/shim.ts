@@ -123,6 +123,7 @@ type ElectronShimState = {
 declare global {
   interface Window {
     __ELECTRON_SHIM__?: ElectronShimState;
+    __PRIMECODEX_SHARED_OBJECT_SNAPSHOT__?: Record<string, unknown>;
   }
 }
 
@@ -558,6 +559,7 @@ export const ipcRenderer = {
 
     if (channel === "codex_desktop:get-shared-object-snapshot") {
       return {
+        ...(window.__PRIMECODEX_SHARED_OBJECT_SNAPSHOT__ ?? {}),
         host_config: { id: "local", display_name: "Local", kind: "local" },
         remote_ssh_connections: [],
         remote_wsl_connections: [],

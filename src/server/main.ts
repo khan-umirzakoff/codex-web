@@ -26,6 +26,10 @@ import {
   readPrimeCodexControlState,
   writePrimeCodexControlState,
 } from "./primecodex-control";
+import {
+  isPersistedSharedObjectKey,
+  PersistentSharedObjectStore,
+} from "./persistent-shared-objects";
 
 type ServerOptions = {
   host: string;
@@ -259,6 +263,7 @@ function compareWorkspaceDirectoryEntries(
 
 type IpcMainBridgeState = {
   broadcastToRenderer?: (message: MainToRendererMessage) => void;
+  initialSharedObjects?: Record<string, unknown>;
   handleRendererInvoke?: (channel: string, args: unknown[]) => Promise<unknown>;
   handleRendererPostMessage?: (
     channel: string,
@@ -409,6 +414,8 @@ function ensureElectronLikeProcessContext(): void {
 
 async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
   const bridgeState = getIpcMainBridgeState();
+  const persistentSharedObjects = await PersistentSharedObjectStore.open();
+  bridgeState.initialSharedObjects = persistentSharedObjects.getSnapshot();
   const app = Fastify({ logger: false });
   const websocketServer = new WebSocketServer({ noServer: true });
   const sockets = new Set<WebSocket>();
@@ -430,7 +437,11 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
   });
 
   app.addHook("onClose", async () => {
-    await Promise.all([codexBackend.close(), primeBackend.close()]);
+    await Promise.all([
+      codexBackend.close(),
+      primeBackend.close(),
+      persistentSharedObjects.close(),
+    ]);
     await fs.rm(primeCodexControlFile, { force: true });
   });
 
@@ -564,13 +575,34 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     decorateReply: false,
   });
 
+  const webviewRoot = path.resolve(__dirname, "../../scratch/asar/webview");
+  const indexHtml = await fs.readFile(
+    path.join(webviewRoot, "index.html"),
+    "utf8",
+  );
+  const renderIndexHtml = (): string => {
+    const serializedSnapshot = JSON.stringify(
+      persistentSharedObjects.getSnapshot(),
+    )
+      .replaceAll("<", "\\u003c")
+      .replaceAll("\u2028", "\\u2028")
+      .replaceAll("\u2029", "\\u2029");
+    const bootstrap = `<script>globalThis.__PRIMECODEX_SHARED_OBJECT_SNAPSHOT__=${serializedSnapshot}</script>`;
+    const preloadTag =
+      '<script type="module" src="./assets/preload.js"></script>';
+    return indexHtml.replace(preloadTag, `${bootstrap}\n    ${preloadTag}`);
+  };
+
   await app.register(fastifyStatic, {
-    root: path.resolve(__dirname, "../../scratch/asar/webview"),
+    root: webviewRoot,
     prefix: "/",
   });
 
   app.get("/", async (_request, reply) => {
-    return reply.sendFile("index.html");
+    return reply
+      .header("cache-control", "no-store")
+      .type("text/html; charset=utf-8")
+      .send(renderIndexHtml());
   });
 
   app.setNotFoundHandler((request, reply) => {
@@ -579,7 +611,10 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     }
 
     if (request.method === "GET") {
-      return reply.sendFile("index.html");
+      return reply
+        .header("cache-control", "no-store")
+        .type("text/html; charset=utf-8")
+        .send(renderIndexHtml());
     }
     return reply.code(404).send({ error: "Not Found" });
   });
@@ -726,6 +761,26 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
 
       if (message.type === "ipc-renderer-invoke") {
         const { channel, requestId, args } = message;
+        if (channel === "codex_desktop:message-from-view") {
+          const viewMessage = args[0];
+          if (
+            viewMessage &&
+            typeof viewMessage === "object" &&
+            !Array.isArray(viewMessage)
+          ) {
+            const sharedObjectMessage = viewMessage as Record<string, unknown>;
+            if (
+              sharedObjectMessage.type === "shared-object-set" &&
+              typeof sharedObjectMessage.key === "string" &&
+              isPersistedSharedObjectKey(sharedObjectMessage.key)
+            ) {
+              persistentSharedObjects.set(
+                sharedObjectMessage.key,
+                sharedObjectMessage.value,
+              );
+            }
+          }
+        }
         Promise.resolve(
           bridgeState.handleRendererInvoke?.(channel, args) ??
             Promise.reject(
