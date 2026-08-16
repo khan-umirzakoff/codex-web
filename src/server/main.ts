@@ -16,6 +16,14 @@ import Fastify from "fastify";
 import fastifyMultipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import { installModuleAliasHook } from "./module";
+import {
+  activateBrowserWebviewGuest,
+  attachBrowserWebviewGuest,
+  detachBrowserWebviewGuest,
+  dispatchBrowserWebviewGuestInput,
+  resizeBrowserWebviewGuest,
+} from "./electron";
+import type { BrowserGuestInput } from "./browser-guest/cdp";
 import { glob } from "glob";
 import { CodexBackend } from "./backends/codex";
 import { PrimeAgentBackend } from "./backends/prime";
@@ -71,6 +79,32 @@ type RendererToMainMessage =
       requestId: string;
       directoryPath: string | null;
       directoriesOnly: boolean;
+    }
+  | {
+      type: "browser-webview-attach";
+      attachmentId: string;
+      attributes: Record<string, string>;
+      width: number;
+      height: number;
+    }
+  | {
+      type: "browser-webview-detach";
+      guestId: number;
+    }
+  | {
+      type: "browser-webview-activate";
+      guestId: number;
+    }
+  | {
+      type: "browser-webview-resize";
+      guestId: number;
+      width: number;
+      height: number;
+    }
+  | {
+      type: "browser-webview-input";
+      guestId: number;
+      input: BrowserGuestInput;
     };
 
 type MainToRendererMessage =
@@ -111,6 +145,27 @@ type MainToRendererMessage =
   | {
       type: "message-port-close";
       portId: string;
+    }
+  | {
+      type: "browser-webview-attached";
+      attachmentId: string;
+      guestId: number;
+    }
+  | {
+      type: "browser-webview-frame";
+      guestId: number;
+      data: string;
+      width: number;
+      height: number;
+    }
+  | {
+      type: "browser-webview-error";
+      attachmentId: string;
+      errorMessage: string;
+    }
+  | {
+      type: "browser-webview-closed";
+      guestId: number;
     };
 
 type WorkspaceDirectoryEntry = {
@@ -646,6 +701,12 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     sockets.add(socket);
 
     const messagePorts = new Map<string, WebSocketMessagePort>();
+    const browserGuestIds = new Set<number>();
+    const sendToSocket = (message: MainToRendererMessage): void => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(message));
+      }
+    };
     const dispatchPostMessage = (
       channel: string,
       message: unknown,
@@ -672,6 +733,10 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
         port.disconnect();
       }
       messagePorts.clear();
+      for (const guestId of browserGuestIds) {
+        void detachBrowserWebviewGuest(guestId);
+      }
+      browserGuestIds.clear();
     });
 
     socket.on("message", (rawData) => {
@@ -684,6 +749,23 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
       }
 
       if (message.type === "ipc-renderer-send") {
+        if (
+          process.env.PRIMECODEX_DEBUG_BROWSER === "1" &&
+          message.channel.includes("codex_desktop")
+        ) {
+          const payload = message.args[0];
+          const type =
+            payload && typeof payload === "object" && !Array.isArray(payload)
+              ? (payload as Record<string, unknown>).type
+              : undefined;
+          if (typeof type === "string" && type.startsWith("browser-sidebar")) {
+            console.error(
+              "[browser-guest] renderer send",
+              message.channel,
+              JSON.stringify(payload),
+            );
+          }
+        }
         bridgeState.handleRendererSend?.(message.channel, message.args);
         return;
       }
@@ -731,6 +813,73 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
         return;
       }
 
+      if (message.type === "browser-webview-attach") {
+        attachBrowserWebviewGuest(message, {
+          onAttached: (guestId) => {
+            browserGuestIds.add(guestId);
+            sendToSocket({
+              type: "browser-webview-attached",
+              attachmentId: message.attachmentId,
+              guestId,
+            });
+          },
+          onFrame: (guestId, frame) => {
+            sendToSocket({
+              type: "browser-webview-frame",
+              guestId,
+              data: frame.data,
+              width: frame.width,
+              height: frame.height,
+            });
+          },
+          onClosed: (guestId) => {
+            browserGuestIds.delete(guestId);
+            sendToSocket({ type: "browser-webview-closed", guestId });
+          },
+        }).catch((error) => {
+          sendToSocket({
+            type: "browser-webview-error",
+            attachmentId: message.attachmentId,
+            errorMessage: errorMessage(error),
+          });
+        });
+        return;
+      }
+
+      if (message.type === "browser-webview-detach") {
+        browserGuestIds.delete(message.guestId);
+        void detachBrowserWebviewGuest(message.guestId);
+        return;
+      }
+
+      if (message.type === "browser-webview-activate") {
+        activateBrowserWebviewGuest(message.guestId);
+        return;
+      }
+
+      if (message.type === "browser-webview-resize") {
+        void resizeBrowserWebviewGuest(
+          message.guestId,
+          message.width,
+          message.height,
+        ).catch((error) => {
+          console.error("[browser-guest] resize failed", error);
+        });
+        return;
+      }
+
+      if (message.type === "browser-webview-input") {
+        void dispatchBrowserWebviewGuestInput(
+          message.guestId,
+          message.input,
+        ).catch((error) => {
+          if (process.env.PRIMECODEX_DEBUG_BROWSER === "1") {
+            console.error("[browser-guest] input failed", error);
+          }
+        });
+        return;
+      }
+
       if (message.type === "workspace-directory-entries-request") {
         const { requestId } = message;
         getWorkspaceDirectoryEntries(message)
@@ -769,6 +918,16 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
             !Array.isArray(viewMessage)
           ) {
             const sharedObjectMessage = viewMessage as Record<string, unknown>;
+            if (
+              process.env.PRIMECODEX_DEBUG_BROWSER === "1" &&
+              typeof sharedObjectMessage.type === "string" &&
+              sharedObjectMessage.type.startsWith("browser-sidebar")
+            ) {
+              console.error(
+                "[browser-guest] renderer message",
+                JSON.stringify(sharedObjectMessage),
+              );
+            }
             if (
               sharedObjectMessage.type === "shared-object-set" &&
               typeof sharedObjectMessage.key === "string" &&

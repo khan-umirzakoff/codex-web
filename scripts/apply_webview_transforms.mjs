@@ -21,6 +21,17 @@ function replaceOnce(source, from, to, label) {
   return source.slice(0, first) + to + source.slice(first + from.length);
 }
 
+function replaceRegexOnce(source, pattern, replacer, label) {
+  const matches = [...source.matchAll(pattern)];
+  if (matches.length === 0) {
+    throw new Error(`transform anchor not found: ${label}`);
+  }
+  if (matches.length !== 1) {
+    throw new Error(`transform anchor is not unique: ${label}`);
+  }
+  return source.replace(pattern, replacer);
+}
+
 function ensureAfter(source, anchor, addition, label) {
   if (source.includes(addition)) return source;
   return replaceOnce(source, anchor, `${anchor}${addition}`, label);
@@ -81,45 +92,102 @@ function transformMainBundle() {
   const asset = findAssetContaining("v5Compat:!0");
   let source = asset.source;
 
-  source = replaceOnce(
-    source,
-    "a.current??=bdn({initialEntries:n,initialIndex:r,v5Compat:!0});",
-    "a.current??=bdn({initialEntries:n??[window.__ELECTRON_SHIM__.initialRoute],initialIndex:r,v5Compat:!0});",
-    "memory router initial route",
-  );
-  source = replaceOnce(
-    source,
-    "l=$C.useCallback(e=>{i===!1?c(e):$C.startTransition(()=>c(e))},[i]);",
-    "l=$C.useCallback(e=>{window.__ELECTRON_SHIM__.onMemoryNavigationChanged?.(e),i===!1?c(e):$C.startTransition(()=>c(e))},[i]);",
-    "memory router navigation callback",
-  );
-
-  source = replaceOnce(
-    source,
-    "Z5n=`app-shell-bottom-panel-launcher-visible`,Q5n=`app-shell-file-tree-open`,$5n=100,tk=Ea(Q,!0),",
-    "Z5n=`app-shell-bottom-panel-launcher-visible`,Q5n=`app-shell-file-tree-open`,$5n=100,tk=Ea(Q,window.__ELECTRON_SHIM__.initialSidebarState),",
-    "initial sidebar atom",
-  );
-  source = replaceOnce(
-    source,
-    "i7n=Ea(Q,()=>new BBe(1)),",
-    "i7n=Ea(Q,()=>new BBe(window.__ELECTRON_SHIM__.initialSidebarState?1:0)),",
-    "initial sidebar animation atom",
-  );
-
-  const statsigPattern =
-    /networkConfig:\{api:[$A-Za-z_][$\w]*,logEventUrl:[$A-Za-z_][$\w]*/g;
-  const statsigMatches = [...source.matchAll(statsigPattern)];
-  if (statsigMatches.length !== 1) {
-    throw new Error(
-      `expected one app Statsig network config, found ${statsigMatches.length}`,
+  if (!source.includes("window.__ELECTRON_SHIM__.initialRoute")) {
+    source = replaceRegexOnce(
+      source,
+      /([$A-Za-z_][$\w]*\.current\?\?=)([$A-Za-z_][$\w]*)\(\{initialEntries:([$A-Za-z_][$\w]*),initialIndex:([$A-Za-z_][$\w]*),v5Compat:!0\}\);/g,
+      (_match, assignment, factory, initialEntries, initialIndex) =>
+        `${assignment}${factory}({initialEntries:${initialEntries}??[window.__ELECTRON_SHIM__.initialRoute],initialIndex:${initialIndex},v5Compat:!0});`,
+      "memory router initial route",
     );
   }
-  const statsigIndex = statsigMatches[0].index;
+  const routerAnchor = source.indexOf("v5Compat:!0");
+  if (routerAnchor < 0) {
+    throw new Error(
+      "transform anchor not found: memory router navigation callback",
+    );
+  }
+  const routerWindowStart = Math.max(0, routerAnchor - 1200);
+  const routerWindowEnd = Math.min(source.length, routerAnchor + 1800);
+  let routerWindow = source.slice(routerWindowStart, routerWindowEnd);
+  if (
+    !routerWindow.includes(
+      "window.__ELECTRON_SHIM__.onMemoryNavigationChanged?.(",
+    )
+  ) {
+    routerWindow = replaceRegexOnce(
+      routerWindow,
+      /([$A-Za-z_][$\w]*)=([$A-Za-z_][$\w]*)\.useCallback\(e=>\{([$A-Za-z_][$\w]*)===!1\?([$A-Za-z_][$\w]*)\(e\):\2\.startTransition\(\(\)=>\4\(e\)\)\},\[\3\]\);/g,
+      (_match, target, react, transitions, commit) =>
+        `${target}=${react}.useCallback(e=>{window.__ELECTRON_SHIM__.onMemoryNavigationChanged?.(e),${transitions}===!1?${commit}(e):${react}.startTransition(()=>${commit}(e))},[${transitions}]);`,
+      "memory router navigation callback",
+    );
+  }
   source =
-    source.slice(0, statsigIndex) +
-    "overrideAdapter:window.__ELECTRON_SHIM__.overrideAdapter," +
-    source.slice(statsigIndex);
+    source.slice(0, routerWindowStart) +
+    routerWindow +
+    source.slice(routerWindowEnd);
+
+  const sidebarLiteral = "`app-shell-file-tree-open`";
+  const sidebarStart = source.indexOf(sidebarLiteral);
+  if (sidebarStart < 0) {
+    throw new Error("transform anchor not found: initial sidebar atom");
+  }
+  const sidebarEnd = source.indexOf("));", sidebarStart);
+  const sidebarSliceEnd =
+    sidebarEnd > sidebarStart ? sidebarEnd + 3 : sidebarStart + 3000;
+  let sidebarSlice = source.slice(sidebarStart, sidebarSliceEnd);
+  const sidebarAtomPattern = /([$A-Za-z_][$\w]*)=Ea\(Q,!0\)/;
+  if (
+    !sidebarSlice.includes("Ea(Q,window.__ELECTRON_SHIM__.initialSidebarState)")
+  ) {
+    if (!sidebarAtomPattern.test(sidebarSlice)) {
+      throw new Error("transform anchor not found: initial sidebar atom");
+    }
+    sidebarSlice = sidebarSlice.replace(
+      sidebarAtomPattern,
+      (_match, atom) =>
+        `${atom}=Ea(Q,window.__ELECTRON_SHIM__.initialSidebarState)`,
+    );
+  }
+  const sidebarAnimationPattern =
+    /([$A-Za-z_][$\w]*)=Ea\(Q,\(\)=>new ([$A-Za-z_][$\w]*)\(1\)\)/;
+  if (
+    !sidebarSlice.includes("window.__ELECTRON_SHIM__.initialSidebarState?1:0")
+  ) {
+    if (!sidebarAnimationPattern.test(sidebarSlice)) {
+      throw new Error(
+        "transform anchor not found: initial sidebar animation atom",
+      );
+    }
+    sidebarSlice = sidebarSlice.replace(
+      sidebarAnimationPattern,
+      (_match, atom, spring) =>
+        `${atom}=Ea(Q,()=>new ${spring}(window.__ELECTRON_SHIM__.initialSidebarState?1:0))`,
+    );
+  }
+  source =
+    source.slice(0, sidebarStart) +
+    sidebarSlice +
+    source.slice(sidebarSliceEnd);
+
+  if (
+    !source.includes("overrideAdapter:window.__ELECTRON_SHIM__.overrideAdapter")
+  ) {
+    const statsigPattern =
+      /networkConfig:\{api:[$A-Za-z_][$\w]*,logEventUrl:[$A-Za-z_][$\w]*/g;
+    const statsigMatches = [...source.matchAll(statsigPattern)];
+    if (statsigMatches.length !== 1) {
+      throw new Error(
+        `expected one app Statsig network config, found ${statsigMatches.length}`,
+      );
+    }
+    const statsigIndex = statsigMatches[0].index;
+    source =
+      source.slice(0, statsigIndex) +
+      "overrideAdapter:window.__ELECTRON_SHIM__.overrideAdapter," +
+      source.slice(statsigIndex);
+  }
 
   const sentryAnchor = "sFr({beforeSend:qon,dsn:e.dsn,";
   if (source.includes(sentryAnchor)) {

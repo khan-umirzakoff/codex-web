@@ -10,6 +10,11 @@ import {
   openSelectWorkspaceRootDialog,
   type WorkspaceDirectoryEntries,
 } from "./workspace-root-dialog";
+import {
+  BrowserGuestDomBridge,
+  type BrowserGuestInput,
+  type BrowserGuestMainMessage,
+} from "./browser-guest";
 
 type IpcListener = (event: unknown, ...args: unknown[]) => void;
 
@@ -45,6 +50,28 @@ type RendererToMainMessage =
       requestId: string;
       directoryPath: string | null;
       directoriesOnly: boolean;
+    }
+  | {
+      type: "browser-webview-attach";
+      attachmentId: string;
+      attributes: Record<string, string>;
+      width: number;
+      height: number;
+    }
+  | {
+      type: "browser-webview-detach";
+      guestId: number;
+    }
+  | {
+      type: "browser-webview-resize";
+      guestId: number;
+      width: number;
+      height: number;
+    }
+  | {
+      type: "browser-webview-input";
+      guestId: number;
+      input: BrowserGuestInput;
     };
 
 type MainToRendererMessage =
@@ -85,6 +112,27 @@ type MainToRendererMessage =
   | {
       type: "message-port-close";
       portId: string;
+    }
+  | {
+      type: "browser-webview-attached";
+      attachmentId: string;
+      guestId: number;
+    }
+  | {
+      type: "browser-webview-frame";
+      guestId: number;
+      data: string;
+      width: number;
+      height: number;
+    }
+  | {
+      type: "browser-webview-error";
+      attachmentId: string;
+      errorMessage: string;
+    }
+  | {
+      type: "browser-webview-closed";
+      guestId: number;
     };
 
 const RECONNECT_DELAY_MS = 1_000;
@@ -132,6 +180,7 @@ declare const __CODEX_APP_VERSION__: string;
 let requestCounter = 0;
 let socket: WebSocket | null = null;
 let reconnectTimeoutId: number | null = null;
+let hasOpenedSocket = false;
 const outboundQueue: RendererToMainMessage[] = [];
 const pendingInvokes = new Map<
   string,
@@ -149,6 +198,9 @@ const pendingDirectoryEntries = new Map<
 >();
 const rendererListeners = new Map<string, Set<IpcListener>>();
 const messagePorts = new Map<string, MessagePort>();
+const browserGuestBridge = new BrowserGuestDomBridge((message) =>
+  enqueueMessage(message),
+);
 
 function unimplemented(method: string): never {
   debugger;
@@ -167,6 +219,16 @@ export function emitRendererEvent(channel: string, args: unknown[]): void {
 }
 
 function handleIncomingMessage(message: MainToRendererMessage): void {
+  if (
+    message.type === "browser-webview-attached" ||
+    message.type === "browser-webview-frame" ||
+    message.type === "browser-webview-error" ||
+    message.type === "browser-webview-closed"
+  ) {
+    browserGuestBridge.handleMessage(message as BrowserGuestMainMessage);
+    return;
+  }
+
   if (message.type === "ipc-main-event") {
     emitRendererEvent(message.channel, message.args);
     return;
@@ -244,6 +306,9 @@ function ensureSocket(): void {
     `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/__backend/ipc`,
   );
   socket.addEventListener("open", () => {
+    const reconnect = hasOpenedSocket;
+    hasOpenedSocket = true;
+    if (reconnect) browserGuestBridge.socketOpened();
     flushOutboundQueue();
   });
   socket.addEventListener("message", (event) => {
@@ -312,6 +377,100 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function normalizeBrowserSidebarSyncMessage(value: unknown): unknown {
+  if (!isRecord(value) || value.type !== "browser-sidebar-sync") return value;
+  if (!isRecord(value.payload)) return value;
+
+  const payload = value.payload;
+  if (
+    payload.hostKind !== "right-panel" ||
+    typeof payload.conversationId !== "string" ||
+    typeof payload.browserTabId !== "string" ||
+    !isRecord(payload.bounds)
+  ) {
+    return value;
+  }
+
+  const bounds = payload.bounds;
+  if (
+    typeof bounds.x !== "number" ||
+    typeof bounds.y !== "number" ||
+    typeof bounds.width !== "number" ||
+    typeof bounds.height !== "number"
+  ) {
+    return value;
+  }
+
+  const rawX = bounds.x;
+  const rawY = bounds.y;
+  const rawWidth = bounds.width;
+  const rawHeight = bounds.height;
+  let nextX = rawX;
+  let nextY = rawY;
+  let nextWidth = rawWidth;
+  let nextHeight = rawHeight;
+
+  const parkedOutsideViewport =
+    rawWidth > 1 &&
+    (rawX >= window.innerWidth - 2 || rawX + rawWidth > window.innerWidth + 2);
+  if (parkedOutsideViewport) {
+    // Native Desktop parks the right panel immediately outside the renderer
+    // viewport and expands the Electron BrowserWindow around it. The web shell
+    // cannot expand its browser viewport, so mirror the CSS compatibility
+    // transform before BrowserSidebarManager computes comment popup geometry.
+    nextX = Math.max(0, rawX - rawWidth);
+  } else {
+    const webview = [
+      ...document.querySelectorAll<HTMLElement>(
+        "webview[data-browser-sidebar-conversation-id][data-browser-sidebar-browser-tab-id]",
+      ),
+    ].find(
+      (candidate) =>
+        candidate.getAttribute("data-browser-sidebar-conversation-id") ===
+          payload.conversationId &&
+        candidate.getAttribute("data-browser-sidebar-browser-tab-id") ===
+          payload.browserTabId,
+    );
+    const rect = webview?.getBoundingClientRect();
+    if (
+      rect &&
+      rect.width > 1 &&
+      rect.height > 1 &&
+      rect.left >= -2 &&
+      rect.left < window.innerWidth - 2 &&
+      rect.right <= window.innerWidth + 2
+    ) {
+      nextX = rect.x;
+      nextY = rect.y;
+      nextWidth = rect.width;
+      nextHeight = rect.height;
+    }
+  }
+
+  if (
+    Math.abs(rawX - nextX) < 0.5 &&
+    Math.abs(rawY - nextY) < 0.5 &&
+    Math.abs(rawWidth - nextWidth) < 0.5 &&
+    Math.abs(rawHeight - nextHeight) < 0.5
+  ) {
+    return value;
+  }
+
+  return {
+    ...value,
+    payload: {
+      ...payload,
+      bounds: {
+        ...bounds,
+        x: nextX,
+        y: nextY,
+        width: nextWidth,
+        height: nextHeight,
+      },
+    },
+  };
+}
+
 function isUnhandledAddWorkspaceRootOptionMessage(value: unknown): value is {
   root?: unknown;
   type: "electron-add-new-workspace-root-option";
@@ -320,6 +479,27 @@ function isUnhandledAddWorkspaceRootOptionMessage(value: unknown): value is {
     isRecord(value) &&
     value.type === "electron-add-new-workspace-root-option" &&
     typeof value.root !== "string"
+  );
+}
+
+function rememberBrowserSidebarNavigation(value: unknown): void {
+  if (
+    !isRecord(value) ||
+    value.type !== "browser-sidebar-command" ||
+    typeof value.conversationId !== "string" ||
+    typeof value.browserTabId !== "string" ||
+    !isRecord(value.command) ||
+    value.command.type !== "navigate" ||
+    typeof value.command.url !== "string" ||
+    !value.command.url
+  ) {
+    return;
+  }
+
+  browserGuestBridge.rememberNavigation(
+    value.conversationId,
+    value.browserTabId,
+    value.command.url,
   );
 }
 
@@ -440,6 +620,9 @@ electronShim.onMemoryNavigationChanged = (navigation) => {
 export const ipcRenderer = {
   invoke(channel: string, ...args: unknown[]): Promise<unknown> {
     if (channel === "codex_desktop:message-from-view" && args.length === 1) {
+      rememberBrowserSidebarNavigation(args[0]);
+      args[0] = normalizeBrowserSidebarSyncMessage(args[0]);
+
       if (isOpenInBrowserMessage(args[0])) {
         window.open(args[0].url, "_blank", "noopener,noreferrer");
       }
@@ -487,6 +670,10 @@ export const ipcRenderer = {
     return this.removeListener(channel, listener);
   },
   send(channel: string, ...args: unknown[]): void {
+    if (channel === "codex_desktop:message-from-view" && args.length === 1) {
+      rememberBrowserSidebarNavigation(args[0]);
+      args[0] = normalizeBrowserSidebarSyncMessage(args[0]);
+    }
     enqueueMessage({
       type: "ipc-renderer-send",
       channel,
@@ -603,7 +790,203 @@ export const ipcRenderer = {
   },
 };
 
+type BrowserCommentPopupRuntime = {
+  frameName: string;
+  iframe: HTMLIFrameElement;
+  popup: Window;
+  closed: boolean;
+};
+
+const browserCommentPopups = new Map<string, BrowserCommentPopupRuntime>();
+
+function parseBrowserCommentPopupFeatures(features: string | undefined): {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+} {
+  const values = new Map<string, number>();
+  for (const part of (features ?? "").split(",")) {
+    const [rawKey, rawValue] = part.split("=", 2);
+    if (!rawKey || rawValue === undefined) continue;
+    const value = Number(rawValue);
+    if (Number.isFinite(value)) values.set(rawKey.trim().toLowerCase(), value);
+  }
+  return {
+    x: values.get("left") ?? values.get("x") ?? 0,
+    y: values.get("top") ?? values.get("y") ?? 0,
+    width: Math.max(220, values.get("width") ?? 294),
+    height: Math.max(120, values.get("height") ?? 208),
+  };
+}
+
+function positionBrowserCommentPopup(
+  runtime: BrowserCommentPopupRuntime,
+  bounds: { x: number; y: number; width: number; height: number },
+): void {
+  const localX = bounds.x - (window.screenX || 0);
+  const localY = bounds.y - (window.screenY || 0);
+  const width = Math.min(bounds.width, Math.max(220, window.innerWidth - 16));
+  const height = Math.min(
+    bounds.height,
+    Math.max(120, window.innerHeight - 16),
+  );
+  const x = Math.min(
+    Math.max(8, localX),
+    Math.max(8, window.innerWidth - width - 8),
+  );
+  const y = Math.min(
+    Math.max(8, localY),
+    Math.max(8, window.innerHeight - height - 8),
+  );
+  Object.assign(runtime.iframe.style, {
+    left: `${x}px`,
+    top: `${y}px`,
+    width: `${width}px`,
+    height: `${height}px`,
+  });
+}
+
+function closeBrowserCommentPopup(runtime: BrowserCommentPopupRuntime): void {
+  if (runtime.closed) return;
+  runtime.closed = true;
+  try {
+    runtime.popup.dispatchEvent(new PageTransitionEvent("pagehide"));
+  } catch {
+    runtime.popup.dispatchEvent(new Event("pagehide"));
+  }
+  runtime.iframe.remove();
+  browserCommentPopups.delete(runtime.frameName);
+}
+
+function installBrowserCommentPopupPolyfill(): void {
+  const nativeOpen = window.open.bind(window);
+  window.open = ((url?: string | URL, target?: string, features?: string) => {
+    const href = String(url ?? "");
+    const frameName = target ?? "";
+    if (
+      href !== "about:blank" ||
+      !frameName.startsWith("codex-renderer-window:browserCommentPopup:")
+    ) {
+      return nativeOpen(href, target, features);
+    }
+
+    const existing = browserCommentPopups.get(frameName);
+    if (existing && !existing.closed && existing.iframe.isConnected) {
+      existing.iframe.style.display = "block";
+      existing.iframe.focus();
+      return existing.popup;
+    }
+
+    const bounds = parseBrowserCommentPopupFeatures(features);
+    const iframe = document.createElement("iframe");
+    iframe.name = frameName;
+    iframe.src = "about:blank";
+    iframe.setAttribute("data-primecodex-browser-comment-popup", frameName);
+    Object.assign(iframe.style, {
+      position: "fixed",
+      border: "0",
+      margin: "0",
+      padding: "0",
+      background: "transparent",
+      colorScheme: "light dark",
+      zIndex: "2147483000",
+      overflow: "hidden",
+      display: "block",
+      visibility: "hidden",
+      pointerEvents: "none",
+    });
+    document.body.append(iframe);
+
+    const popupWindow = iframe.contentWindow;
+    if (!popupWindow) {
+      iframe.remove();
+      return null;
+    }
+
+    const runtime: BrowserCommentPopupRuntime = {
+      frameName,
+      iframe,
+      popup: popupWindow,
+      closed: false,
+    };
+    positionBrowserCommentPopup(runtime, bounds);
+
+    const proxy = new Proxy(popupWindow, {
+      get(targetWindow, prop) {
+        if (prop === "closed")
+          return runtime.closed || !runtime.iframe.isConnected;
+        if (prop === "close") return () => closeBrowserCommentPopup(runtime);
+        if (prop === "focus") {
+          return () => {
+            runtime.iframe.style.display = "block";
+            runtime.iframe.focus();
+          };
+        }
+        const value = Reflect.get(targetWindow, prop, targetWindow);
+        return typeof value === "function" ? value.bind(targetWindow) : value;
+      },
+    }) as Window;
+    runtime.popup = proxy;
+    browserCommentPopups.set(frameName, runtime);
+
+    ipcRenderer.send("primecodex:browser-comment-popup-created", {
+      frameName,
+      bounds,
+    });
+    return proxy;
+  }) as typeof window.open;
+
+  ipcRenderer.on(
+    "primecodex:browser-comment-popup-command",
+    (_event, payload) => {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload))
+        return;
+      const command = payload as {
+        frameName?: string;
+        type?: string;
+        bounds?: { x?: number; y?: number; width?: number; height?: number };
+      };
+      if (!command.frameName) return;
+      const runtime = browserCommentPopups.get(command.frameName);
+      if (!runtime) return;
+
+      if (command.type === "set-bounds" && command.bounds) {
+        const current = runtime.iframe.getBoundingClientRect();
+        positionBrowserCommentPopup(runtime, {
+          x: command.bounds.x ?? current.x + (window.screenX || 0),
+          y: command.bounds.y ?? current.y + (window.screenY || 0),
+          width: command.bounds.width ?? current.width,
+          height: command.bounds.height ?? current.height,
+        });
+        return;
+      }
+      if (command.type === "show") {
+        runtime.iframe.style.visibility = "visible";
+        runtime.iframe.style.pointerEvents = "auto";
+        return;
+      }
+      if (command.type === "hide") {
+        // Electron keeps a hidden BrowserWindow laid out; display:none would
+        // collapse the native comment editor's first measurement to 0x0.
+        runtime.iframe.style.visibility = "hidden";
+        runtime.iframe.style.pointerEvents = "none";
+        return;
+      }
+      if (command.type === "focus") {
+        runtime.iframe.focus();
+        return;
+      }
+      if (command.type === "close") {
+        closeBrowserCommentPopup(runtime);
+      }
+    },
+  );
+}
+
 ensureSocket();
+browserGuestBridge.start();
+installBrowserCommentPopupPolyfill();
 
 export const contextBridge = {
   exposeInMainWorld(_key: string, _api: unknown): void {

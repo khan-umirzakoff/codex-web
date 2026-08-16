@@ -1,3 +1,9 @@
+import {
+  CdpBrowserGuest,
+  type BrowserGuestFrame,
+  type BrowserGuestInput,
+} from "../browser-guest/cdp";
+
 type StubFunction = (...args: unknown[]) => unknown;
 type StubListener = (...args: unknown[]) => void;
 type StubMessagePort = {
@@ -19,6 +25,20 @@ type StubWebContents = {
   removeListener: (event: string, listener: StubListener) => unknown;
   send: (channel: string, ...args: unknown[]) => void;
 };
+
+export type BrowserWebviewGuestAttachRequest = {
+  attachmentId: string;
+  attributes: Record<string, string>;
+  width: number;
+  height: number;
+};
+
+export type BrowserWebviewGuestCallbacks = {
+  onAttached: (guestId: number) => void;
+  onFrame: (guestId: number, frame: BrowserGuestFrame) => void;
+  onClosed?: (guestId: number) => void;
+};
+
 type IpcMainEvent = {
   returnValue: unknown;
   processId: number;
@@ -53,6 +73,16 @@ type IpcMainBridgeState = {
     channel: string,
     args: unknown[],
     sourceUrl?: string,
+  ) => void;
+  handleWebContentsInvoke?: (
+    sender: StubWebContents,
+    channel: string,
+    args: unknown[],
+  ) => Promise<unknown>;
+  handleWebContentsSend?: (
+    sender: StubWebContents,
+    channel: string,
+    args: unknown[],
   ) => void;
 };
 
@@ -190,8 +220,12 @@ const rendererWebContents: StubWebContents = {
   },
 };
 
-function createIpcMainEvent(ports: StubMessagePort[] = []): IpcMainEvent {
+function createIpcMainEvent(
+  ports: StubMessagePort[] = [],
+  senderOverride?: StubWebContents,
+): IpcMainEvent {
   const sender =
+    senderOverride ??
     (BrowserWindow.fromWebContents(rendererWebContents)
       ?.webContents as unknown as StubWebContents | undefined) ??
     rendererWebContents;
@@ -269,6 +303,51 @@ function createIpcMainStub(): {
   ): void => {
     const event = createIpcMainEvent();
     emitter.emit(channel, event, ...args);
+  };
+
+  bridgeState.handleWebContentsInvoke = async (
+    sender: StubWebContents,
+    channel: string,
+    args: unknown[],
+  ): Promise<unknown> => {
+    const debugBrowser = process.env.PRIMECODEX_DEBUG_BROWSER === "1";
+    const handler = handlers.get(channel);
+    if (debugBrowser) {
+      console.error(
+        `[primecodex-browser] main invoke ${channel} sender=${String(sender.id)} handler=${handler ? "yes" : "no"}`,
+        args[0] && typeof args[0] === "object"
+          ? { type: (args[0] as { type?: unknown }).type }
+          : undefined,
+      );
+    }
+    if (!handler) {
+      throw new Error(`[electron-main-stub] No ipcMain.handle for ${channel}`);
+    }
+    try {
+      const result = await Promise.resolve(
+        handler(createIpcMainEvent([], sender), ...args),
+      );
+      if (debugBrowser) {
+        console.error(`[primecodex-browser] main invoke ok ${channel}`, result);
+      }
+      return result;
+    } catch (error) {
+      if (debugBrowser) {
+        console.error(
+          `[primecodex-browser] main invoke failed ${channel}`,
+          error,
+        );
+      }
+      throw error;
+    }
+  };
+
+  bridgeState.handleWebContentsSend = (
+    sender: StubWebContents,
+    channel: string,
+    args: unknown[],
+  ): void => {
+    emitter.emit(channel, createIpcMainEvent([], sender), ...args);
   };
 
   return {
@@ -465,6 +544,7 @@ class BrowserWindow {
   private visible = true;
   private title = "Codex";
   private bounds = { x: 0, y: 0, width: 1280, height: 820 };
+  primeCodexPopupFrameName?: string;
   webContents: Record<string, unknown>;
   private readonly emitter: ReturnType<typeof createEmitterStub>;
 
@@ -473,9 +553,21 @@ class BrowserWindow {
     this.id = BrowserWindow.nextId++;
     const options =
       args[0] && typeof args[0] === "object"
-        ? (args[0] as { show?: boolean })
+        ? (args[0] as {
+            show?: boolean;
+            x?: number;
+            y?: number;
+            width?: number;
+            height?: number;
+          })
         : undefined;
     this.visible = options?.show !== false;
+    this.bounds = {
+      x: options?.x ?? 0,
+      y: options?.y ?? 0,
+      width: options?.width ?? 1280,
+      height: options?.height ?? 820,
+    };
     this.emitter = createEmitterStub(`BrowserWindow#${this.id}`);
 
     const webContentsEmitter = createEmitterStub(
@@ -562,11 +654,24 @@ class BrowserWindow {
   }
 
   static fromWebContents(
-    webContents: { id?: unknown } | null | undefined,
+    webContents: { id?: unknown; hostWebContents?: unknown } | null | undefined,
   ): BrowserWindow | null {
     log("BrowserWindow.fromWebContents", [webContents]);
     if (!webContents) {
       return null;
+    }
+
+    if (
+      webContents instanceof CdpBrowserGuest &&
+      webContents.hostWebContents &&
+      webContents.hostWebContents !== webContents
+    ) {
+      return BrowserWindow.fromWebContents(
+        webContents.hostWebContents as {
+          id?: unknown;
+          hostWebContents?: unknown;
+        },
+      );
     }
 
     return (
@@ -615,6 +720,7 @@ class BrowserWindow {
       BrowserWindow.focusedWindow = null;
     }
     this.emitter.emit("closed");
+    this.syncPrimeCodexPopup("close");
   }
 
   isDestroyed(): boolean {
@@ -651,6 +757,11 @@ class BrowserWindow {
     return { ...this.bounds };
   }
 
+  getContentBounds(): { height: number; width: number; x: number; y: number } {
+    log(`BrowserWindow#${this.id}.getContentBounds`, []);
+    return { ...this.bounds };
+  }
+
   setBounds(nextBounds: {
     height?: number;
     width?: number;
@@ -664,25 +775,202 @@ class BrowserWindow {
       width: nextBounds.width ?? this.bounds.width,
       height: nextBounds.height ?? this.bounds.height,
     };
+    this.syncPrimeCodexPopup("set-bounds", { bounds: this.bounds });
   }
 
   show(): void {
     log(`BrowserWindow#${this.id}.show`, []);
     this.visible = true;
     this.emitter.emit("show");
+    this.syncPrimeCodexPopup("show");
+  }
+
+  showInactive(): void {
+    log(`BrowserWindow#${this.id}.showInactive`, []);
+    this.visible = true;
+    this.emitter.emit("show");
+    this.syncPrimeCodexPopup("show");
   }
 
   hide(): void {
     log(`BrowserWindow#${this.id}.hide`, []);
     this.visible = false;
     this.emitter.emit("hide");
+    this.syncPrimeCodexPopup("hide");
   }
 
   focus(): void {
     log(`BrowserWindow#${this.id}.focus`, []);
     BrowserWindow.focusedWindow = this;
     this.emitter.emit("focus");
+    this.syncPrimeCodexPopup("focus");
   }
+
+  private syncPrimeCodexPopup(
+    type: string,
+    payload: Record<string, unknown> = {},
+  ): void {
+    const frameName = this.primeCodexPopupFrameName;
+    if (!frameName) return;
+    getIpcMainBridgeState().broadcastToRenderer?.({
+      type: "ipc-main-event",
+      channel: "primecodex:browser-comment-popup-command",
+      args: [{ frameName, type, ...payload }],
+    });
+  }
+}
+
+const browserGuestWebContents = new Map<number, CdpBrowserGuest>();
+let nextBrowserWebviewInstanceId = 1;
+
+function rendererOwnerWebContents(): Record<string, unknown> | undefined {
+  return (
+    BrowserWindow.fromWebContents(rendererWebContents)?.webContents ??
+    BrowserWindow.getFocusedWindow()?.webContents ??
+    BrowserWindow.getAllWindows()[0]?.webContents
+  );
+}
+
+function emitWebContentsEvent(
+  webContents: Record<string, unknown>,
+  event: string,
+  ...args: unknown[]
+): boolean {
+  const emit = webContents.emit;
+  if (typeof emit !== "function") return false;
+  return Boolean(emit.call(webContents, event, ...args));
+}
+
+export async function attachBrowserWebviewGuest(
+  request: BrowserWebviewGuestAttachRequest,
+  callbacks: BrowserWebviewGuestCallbacks,
+): Promise<number> {
+  const owner = rendererOwnerWebContents();
+  if (!owner) {
+    throw new Error(
+      "PrimeCodex browser guest has no renderer owner WebContents",
+    );
+  }
+
+  const instanceId = nextBrowserWebviewInstanceId++;
+  const baseParams: Record<string, unknown> = {
+    ...request.attributes,
+    src: request.attributes.src ?? "about:blank",
+    partition: request.attributes.partition ?? "",
+    instanceId,
+    viewInstanceId: instanceId,
+  };
+
+  let webPreferences: Record<string, unknown> | undefined;
+  let acceptedParams: Record<string, unknown> | undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const params = { ...baseParams };
+    const preferences: Record<string, unknown> = {};
+    const event = {
+      defaultPrevented: false,
+      preventDefault(): void {
+        this.defaultPrevented = true;
+      },
+    };
+    const handled = emitWebContentsEvent(
+      owner,
+      "will-attach-webview",
+      event,
+      preferences,
+      params,
+    );
+    // EventEmitter.emit() returns false when the native BrowserSidebarManager
+    // has not registered its listener yet. Treating that as an accepted attach
+    // races cold startup and silently loses the native browser-page preload.
+    if (handled && !event.defaultPrevented) {
+      webPreferences = preferences;
+      acceptedParams = params;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  if (!webPreferences || !acceptedParams) {
+    throw new Error(
+      "Native BrowserSidebarManager rejected the browser guest attachment",
+    );
+  }
+
+  let guest!: CdpBrowserGuest;
+  guest = new CdpBrowserGuest({
+    width: request.width,
+    height: request.height,
+    preloadPath:
+      typeof webPreferences.preload === "string"
+        ? webPreferences.preload
+        : undefined,
+    onFrame: (frame) => callbacks.onFrame(guest.id, frame),
+    onIpcInvoke: async (channel, args) => {
+      const invoke = getIpcMainBridgeState().handleWebContentsInvoke;
+      if (!invoke) {
+        throw new Error(
+          `[electron-main-stub] guest IPC invoke unavailable for ${channel}`,
+        );
+      }
+      return await invoke(guest as unknown as StubWebContents, channel, args);
+    },
+    onIpcSend: (channel, args) => {
+      getIpcMainBridgeState().handleWebContentsSend?.(
+        guest as unknown as StubWebContents,
+        channel,
+        args,
+      );
+    },
+  });
+  guest.viewInstanceId = instanceId;
+  guest.hostWebContents = owner;
+  guest.session = webPreferences.session;
+  browserGuestWebContents.set(guest.id, guest);
+  guest.once("destroyed", () => {
+    browserGuestWebContents.delete(guest.id);
+    callbacks.onClosed?.(guest.id);
+  });
+
+  try {
+    await guest.start();
+    emitWebContentsEvent(owner, "did-attach-webview", {}, guest);
+    callbacks.onAttached(guest.id);
+    return guest.id;
+  } catch (error) {
+    browserGuestWebContents.delete(guest.id);
+    await guest.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function detachBrowserWebviewGuest(
+  guestId: number,
+): Promise<void> {
+  const guest = browserGuestWebContents.get(guestId);
+  if (!guest) return;
+  browserGuestWebContents.delete(guestId);
+  await guest.close();
+}
+
+export async function resizeBrowserWebviewGuest(
+  guestId: number,
+  width: number,
+  height: number,
+): Promise<void> {
+  await browserGuestWebContents.get(guestId)?.setViewport(width, height);
+}
+
+export function activateBrowserWebviewGuest(guestId: number): void {
+  browserGuestWebContents.get(guestId)?.focus();
+}
+
+export async function dispatchBrowserWebviewGuestInput(
+  guestId: number,
+  input: BrowserGuestInput,
+): Promise<void> {
+  const guest = browserGuestWebContents.get(guestId);
+  if (!guest) return;
+  await guest.dispatchInput(input);
 }
 
 class WebContentsView {
@@ -860,6 +1148,45 @@ const net = {
 
 const autoUpdater = createEmitterStub("autoUpdater");
 const ipcMain = createIpcMainStub();
+ipcMain.on(
+  "primecodex:browser-comment-popup-created",
+  (event: unknown, payload: unknown) => {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload))
+      return;
+    const record = payload as Record<string, unknown>;
+    const frameName =
+      typeof record.frameName === "string" ? record.frameName : "";
+    if (!frameName.startsWith("codex-renderer-window:browserCommentPopup:")) {
+      return;
+    }
+
+    const owner = (event as IpcMainEvent).sender as StubWebContents & {
+      emit?: (event: string, ...args: unknown[]) => boolean;
+    };
+    if (typeof owner.emit !== "function") return;
+
+    const bounds =
+      record.bounds &&
+      typeof record.bounds === "object" &&
+      !Array.isArray(record.bounds)
+        ? (record.bounds as Record<string, unknown>)
+        : {};
+    const popup = new BrowserWindow({
+      show: false,
+      x: typeof bounds.x === "number" ? bounds.x : undefined,
+      y: typeof bounds.y === "number" ? bounds.y : undefined,
+      width: typeof bounds.width === "number" ? bounds.width : 294,
+      height: typeof bounds.height === "number" ? bounds.height : 208,
+    });
+    popup.primeCodexPopupFrameName = frameName;
+    owner.emit("did-create-window", popup, {
+      frameName,
+      url: "about:blank",
+      options: {},
+      disposition: "new-window",
+    });
+  },
+);
 const nativeTheme = {
   ...createEmitterStub("nativeTheme"),
   shouldUseDarkColors: false,
@@ -1072,13 +1399,20 @@ const utilityProcess = {
 const webContents = {
   fromId(id: number): Record<string, unknown> | undefined {
     log("webContents.fromId", [id]);
+    const browserGuest = browserGuestWebContents.get(id);
+    if (browserGuest) return browserGuest as unknown as Record<string, unknown>;
     return BrowserWindow.getAllWindows().find(
       (window) => window.webContents.id === id,
     )?.webContents;
   },
   getAllWebContents(): Record<string, unknown>[] {
     log("webContents.getAllWebContents", []);
-    return BrowserWindow.getAllWindows().map((window) => window.webContents);
+    return [
+      ...BrowserWindow.getAllWindows().map((window) => window.webContents),
+      ...[...browserGuestWebContents.values()].map(
+        (guest) => guest as unknown as Record<string, unknown>,
+      ),
+    ];
   },
   getFocusedWebContents(): Record<string, unknown> | null {
     log("webContents.getFocusedWebContents", []);
